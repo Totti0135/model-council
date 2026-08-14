@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Smoke test — no pytest required, run it directly:
+
+    python tests/test_smoke.py
+
+Verifies the tool surface, both configuration sources, provider inheritance and
+${ENV} expansion, and graceful degradation when a member is unconfigured. If a
+usable .env is present it finishes with a live round-trip through ask_all.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+from model_council import config as cfg
+
+
+@contextmanager
+def env(**overrides: str):
+    """Run with exactly the given COUNCIL_/model vars set, nothing inherited."""
+    saved = dict(os.environ)
+    for k in list(os.environ):
+        if k.startswith("COUNCIL_") or k.endswith(
+            ("_BASE_URL", "_API_KEY", "_MODEL", "_FORMAT", "_HEADERS", "_ENABLED")
+        ):
+            del os.environ[k]
+    os.environ["COUNCIL_ENV_FILE"] = "/nonexistent"
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_default_roster() -> None:
+    with env():
+        c = cfg.load_council()
+    assert sorted(c.members) == ["chatgpt", "glm"], c.members
+    assert c.members["glm"].base_url == "https://open.bigmodel.cn/api/paas/v4"
+    assert not c.members["chatgpt"].configured
+    assert c.members["chatgpt"].missing == ["base_url", "api_key"], c.members["chatgpt"].missing
+    print("ok  default roster (legacy CHATGPT_*/GLM_* prefixes still work)")
+
+
+def test_env_roster() -> None:
+    with env(
+        COUNCIL_MODELS="gpt5, glm, kimi",
+        GPT5_BASE_URL="https://relay-a/v1/",
+        GPT5_API_KEY="sk-a",
+        GPT5_MODEL="gpt-5.6-sol",
+        GPT5_LABEL="GPT-5.6",
+        GLM_BASE_URL="https://open.bigmodel.cn/api/anthropic",
+        GLM_API_KEY="k",
+        GLM_MODEL="glm-5.2",
+        GLM_FORMAT="anthropic",
+        KIMI_ENABLED="false",
+    ):
+        c = cfg.load_council()
+    assert c.ids == ["gpt5", "glm"], c.ids           # kimi disabled, and not in ids
+    assert c.members["gpt5"].label == "GPT-5.6"
+    assert c.members["gpt5"].base_url == "https://relay-a/v1"   # trailing slash trimmed
+    assert c.members["glm"].format == "anthropic"
+    assert c.get("kimi") is None                      # disabled members are unreachable
+    print("ok  env roster (COUNCIL_MODELS, labels, per-member enable)")
+
+
+def test_file_config() -> None:
+    doc = {
+        "providers": {
+            "relay-a": {"base_url": "https://relay-a/v1", "api_key": "${RELAY_A_KEY}",
+                        "format": "openai", "headers": {"X-Trace": "council"}},
+            "zhipu": {"base_url": "https://open.bigmodel.cn/api/anthropic",
+                      "api_key": "${GLM_KEY}", "format": "anthropic"},
+        },
+        "members": [
+            {"id": "gpt5", "provider": "relay-a", "model": "gpt-5.6-sol", "label": "GPT-5.6"},
+            {"id": "codex", "provider": "relay-a", "model": "gpt-5-codex", "temperature": 0.2},
+            {"id": "glm", "provider": "zhipu", "model": "glm-5.2", "max_tokens": 4096},
+            {"id": "kimi", "base_url": "https://api.moonshot.cn/v1",
+             "api_key": "${KIMI_KEY}", "model": "kimi-k2"},
+            {"id": "bad", "provider": "nope", "model": "x", "typo_field": 1},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path), RELAY_A_KEY="sk-a", GLM_KEY="sk-g", KIMI_KEY="sk-k"):
+            c = cfg.load_council()
+
+    # two members share one provider's endpoint and key — declared once
+    assert c.members["gpt5"].base_url == c.members["codex"].base_url == "https://relay-a/v1"
+    assert c.members["gpt5"].api_key == "sk-a"                    # ${ENV} expanded
+    assert c.members["codex"].headers == {"X-Trace": "council"}   # inherited from provider
+    assert c.members["codex"].temperature == 0.2                  # member-level override
+    assert c.members["glm"].max_tokens == 4096
+    assert c.members["kimi"].configured                           # inline connection, no provider
+    assert c.members["kimi"].label == "kimi"                      # label defaults to id
+    assert not c.members["bad"].configured
+    assert any("unknown provider 'nope'" in w for w in c.warnings), c.warnings
+    assert any("typo_field" in w for w in c.warnings), c.warnings
+    print("ok  file config (provider reuse, ${ENV}, overrides, warnings)")
+
+
+def test_shipped_example_is_valid() -> None:
+    """The example we hand users must load cleanly — no warnings, no typos."""
+    example = Path(__file__).resolve().parent.parent / "examples" / "config.json"
+    if not example.exists():
+        print("--  skipped shipped-example check (examples/ not present)")
+        return
+    with env(COUNCIL_CONFIG=str(example), MY_RELAY_KEY="sk-a", GLM_KEY="sk-g", KIMI_KEY="sk-k"):
+        c = cfg.load_council()
+    assert not c.warnings, c.warnings
+    assert c.ids == ["gpt5", "codex", "glm", "kimi"], c.ids   # 'spare' is disabled
+    assert all(c.members[i].configured for i in c.ids), c.members
+    print("ok  examples/config.json loads with no warnings")
+
+
+def test_missing_file_falls_back() -> None:
+    with env(COUNCIL_CONFIG="/nope/config.json"):
+        c = cfg.load_council()
+    assert c.members and "environment" in c.source, c.source
+    assert any("does not exist" in w for w in c.warnings), c.warnings
+    print("ok  missing config file degrades to env instead of crashing")
+
+
+async def test_tools() -> None:
+    from model_council import server as s
+
+    names = sorted(t.name for t in await s.mcp.list_tools())
+    assert names == ["ask", "ask_all", "list_council", "probe_models"], names
+
+    tools = {t.name: t for t in await s.mcp.list_tools()}
+    assert "Available ids:" in (tools["ask"].description or "")
+
+    bad = await s.ask(model="does-not-exist", prompt="hi")
+    assert "unknown model id" in bad, bad
+
+    print("ok  tool surface:", names)
+    print()
+    print(await s.list_council())
+
+    if any(m.configured for m in s.COUNCIL.members.values()):
+        print("\nLive round-trip via ask_all:\n")
+        print(await s.ask_all("Reply with exactly one word: pong"))
+    else:
+        print("\n(no live keys configured — skipped the network round-trip)")
+
+
+def main() -> None:
+    test_default_roster()
+    test_env_roster()
+    test_file_config()
+    test_shipped_example_is_valid()
+    test_missing_file_falls_back()
+    asyncio.run(test_tools())
+
+
+if __name__ == "__main__":
+    main()

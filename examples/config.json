@@ -1,0 +1,39 @@
+{
+  "$comment": [
+    "Point COUNCIL_CONFIG at this file, or drop it at ~/.config/model-council/config.json",
+    "where the server finds it automatically. Declare each endpoint once under",
+    "'providers', then list the models you want on the council under 'members'.",
+    "${ENV_VAR} is expanded from the environment, so this file can be shared or",
+    "committed without the keys in it."
+  ],
+
+  "providers": {
+    "my-relay": {
+      "base_url": "https://your-openai-compatible-host/v1",
+      "api_key": "${MY_RELAY_KEY}",
+      "format": "openai",
+      "headers": { "X-Trace": "model-council" }
+    },
+    "zhipu": {
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "api_key": "${GLM_KEY}",
+      "format": "anthropic"
+    }
+  },
+
+  "members": [
+    { "id": "gpt5", "provider": "my-relay", "model": "gpt-5", "label": "GPT-5" },
+    { "id": "codex", "provider": "my-relay", "model": "gpt-5-codex", "temperature": 0.2 },
+    { "id": "glm", "provider": "zhipu", "model": "glm-4.6", "max_tokens": 8192 },
+
+    {
+      "$comment": "a member may skip 'provider' and carry its own connection",
+      "id": "kimi",
+      "base_url": "https://api.moonshot.cn/v1",
+      "api_key": "${KIMI_KEY}",
+      "model": "kimi-k2"
+    },
+
+    { "id": "spare", "provider": "my-relay", "model": "some-other-model", "enabled": false }
+  ]
+}

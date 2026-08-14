@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "model-council": {
+      "command": "uvx",
+      "args": ["model-council-mcp"],
+      "env": {
+        "COUNCIL_MODELS": "gpt5,glm",
+
+        "GPT5_BASE_URL": "https://your-openai-compatible-host/v1",
+        "GPT5_API_KEY": "sk-xxxxxxxx",
+        "GPT5_MODEL": "gpt-5",
+        "GPT5_LABEL": "GPT-5",
+
+        "GLM_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+        "GLM_API_KEY": "xxxxxxxx",
+        "GLM_MODEL": "glm-4.6",
+        "GLM_FORMAT": "anthropic"
+      }
+    }
+  }
+}

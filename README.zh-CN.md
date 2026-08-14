@@ -19,6 +19,8 @@
 
 ## 安装
 
+本服务器已上架官方 [MCP Registry](https://registry.modelcontextprotocol.io)，名字是 `io.github.Totti0135/model-council` —— 支持浏览注册表的客户端可以直接在里面找到并添加。想手动配置就接着往下看。
+
 服务器直接从 PyPI 运行，不用 clone，也不用建虚拟环境。需要先装 [uv](https://docs.astral.sh/uv/)：
 
 ```bash

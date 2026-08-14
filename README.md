@@ -28,7 +28,11 @@ it puts one member's answer inside another's `prompt`.
 
 ## Install
 
-The server runs from PyPI with no clone and no virtualenv. You need
+The server is listed on the official [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.Totti0135/model-council`, so a client that browses the registry can
+find and add it there. To wire it up by hand instead, read on.
+
+It runs from PyPI with no clone and no virtualenv. You need
 [uv](https://docs.astral.sh/uv/):
 
 ```bash

@@ -137,17 +137,28 @@ endpoint. Set `COUNCIL_CONFIG=/path/to/config.json`, or drop the file at
 ```
 
 `${ENV_VAR}` is expanded from the environment, so the file carries no secrets and
-can be shared or committed. A member may skip `provider` and inline its own
-connection details, and any provider field can be overridden per member. See
-[examples/config.json](examples/config.json) for a fully annotated version.
+can be shared or committed. See [examples/config.json](examples/config.json) for a
+fully annotated version.
+
+A member gets its connection one of two ways, never a mix of both: name a
+`provider` and take that endpoint whole, or omit `provider` and supply
+`base_url` + `api_key` + `format` yourself (as `kimi` does above). Naming a
+provider *and* overriding one of those three is refused — that member is
+disabled and `list_council` says why. The reason is that a partial override
+would pair one endpoint's credentials with another endpoint's URL, quietly
+sending your key to a host it was never issued for. Per-member `headers`,
+`timeout`, `temperature`, `max_tokens` and `label` are not part of that
+identity and stay overridable.
 
 ### Fields
 
+The first three travel together as one unit — see the rule above.
+
 | Field | Applies to | Notes |
 |-------|-----------|-------|
-| `base_url` | provider, member | Root the route hangs off — `/chat/completions` for openai, `/v1/messages` for anthropic. Usually ends in `/v1` for OpenAI-compatible hosts |
-| `api_key` | provider, member | |
-| `format` | provider, member | `openai` (default) or `anthropic` |
+| `base_url` | provider, or a member with no provider | Root the route hangs off — `/chat/completions` for openai, `/v1/messages` for anthropic. Usually ends in `/v1` for OpenAI-compatible hosts |
+| `api_key` | provider, or a member with no provider | |
+| `format` | provider, or a member with no provider | `openai` (default) or `anthropic` |
 | `model` | member | The model id sent to the endpoint |
 | `label` | member | Display name in answers; defaults to the id |
 | `max_tokens` | member | Anthropic format only, where it is required. Default 8192 |

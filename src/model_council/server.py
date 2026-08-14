@@ -89,7 +89,7 @@ async def list_council() -> str:
     for m in COUNCIL.members.values():
         status = "ready" if m.configured else f"missing {', '.join(m.missing)}"
         if not m.enabled:
-            status = "disabled"
+            status = f"disabled — {m.disabled_reason}" if m.disabled_reason else "disabled"
         rows.append((m.id, m.label, m.model or "-", m.format, m.base_url or "-", status))
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]

@@ -117,15 +117,19 @@ GLM_FORMAT=anthropic
 }
 ```
 
-`${ENV_VAR}` 会从环境变量展开，所以这个文件本身不含密钥，可以放心分享或提交。成员可以不写 `provider` 而内联自己的连接信息，也可以覆盖 provider 的任意字段。完整带注释的版本见 [examples/config.json](examples/config.json)。
+`${ENV_VAR}` 会从环境变量展开，所以这个文件本身不含密钥，可以放心分享或提交。完整带注释的版本见 [examples/config.json](examples/config.json)。
+
+成员获得连接只有两条路，不能混用：要么写 `provider` 整份继承那个端点，要么不写 `provider` 而自己给全 `base_url` + `api_key` + `format`（见上面的 `kimi`）。**写了 `provider` 又覆盖这三者之一会被拒绝** —— 该成员被禁用，`list_council` 会说明原因。理由是：部分覆盖会把一个端点的凭据配上另一个端点的地址，静默地把你的密钥发往一个从未为它签发的主机。成员级的 `headers`、`timeout`、`temperature`、`max_tokens`、`label` 不属于这个身份，照旧可以覆盖。
 
 ### 字段
 
+前三个字段作为一个整体存在，见上面的规则。
+
 | 字段 | 适用于 | 说明 |
 |------|--------|------|
-| `base_url` | provider、member | 路由挂载的根地址 —— openai 协议拼 `/chat/completions`，anthropic 协议拼 `/v1/messages`。OpenAI 兼容端点通常以 `/v1` 结尾 |
-| `api_key` | provider、member | |
-| `format` | provider、member | `openai`（默认）或 `anthropic` |
+| `base_url` | provider，或未写 provider 的 member | 路由挂载的根地址 —— openai 协议拼 `/chat/completions`，anthropic 协议拼 `/v1/messages`。OpenAI 兼容端点通常以 `/v1` 结尾 |
+| `api_key` | provider，或未写 provider 的 member | |
+| `format` | provider，或未写 provider 的 member | `openai`（默认）或 `anthropic` |
 | `model` | member | 发给端点的模型 id |
 | `label` | member | 回答里显示的名字，默认用 id |
 | `max_tokens` | member | 仅 anthropic 协议，该协议要求必填。默认 8192 |

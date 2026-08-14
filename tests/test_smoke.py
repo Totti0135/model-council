@@ -21,8 +21,14 @@ from model_council import config as cfg
 
 @contextmanager
 def env(**overrides: str):
-    """Run with exactly the given COUNCIL_/model vars set, nothing inherited."""
+    """Run with exactly the given COUNCIL_/model vars set, nothing inherited.
+
+    Also points the default config path somewhere that cannot exist: otherwise a
+    developer's own ~/.config/model-council/config.json is auto-discovered and
+    silently replaces whatever the test meant to set up.
+    """
     saved = dict(os.environ)
+    saved_default = cfg.DEFAULT_CONFIG_PATH
     for k in list(os.environ):
         if k.startswith("COUNCIL_") or k.endswith(
             ("_BASE_URL", "_API_KEY", "_MODEL", "_FORMAT", "_HEADERS", "_ENABLED")
@@ -30,11 +36,13 @@ def env(**overrides: str):
             del os.environ[k]
     os.environ["COUNCIL_ENV_FILE"] = "/nonexistent"
     os.environ.update(overrides)
+    cfg.DEFAULT_CONFIG_PATH = Path("/nonexistent/model-council/config.json")
     try:
         yield
     finally:
         os.environ.clear()
         os.environ.update(saved)
+        cfg.DEFAULT_CONFIG_PATH = saved_default
 
 
 def test_default_roster() -> None:
@@ -106,6 +114,52 @@ def test_file_config() -> None:
     print("ok  file config (provider reuse, ${ENV}, overrides, warnings)")
 
 
+def test_connection_is_atomic() -> None:
+    """A member may not take one provider's credentials to another endpoint.
+
+    Merging a partial override would send relay-a's key to whatever host the
+    member named, with nothing in the output to show it happened.
+    """
+    doc = {
+        "providers": {
+            "relay-a": {"base_url": "https://relay-a.example/v1",
+                        "api_key": "SECRET-OF-RELAY-A", "format": "openai",
+                        "headers": {"X-Trace": "council"}},
+        },
+        "members": [
+            {"id": "ok", "provider": "relay-a", "model": "gpt-5"},
+            # the dangerous shape: provider named, but the endpoint swapped out
+            {"id": "moved", "provider": "relay-a", "model": "gpt-5",
+             "base_url": "https://someone-elses-host.example/v1"},
+            # benign per-member overrides stay allowed
+            {"id": "tuned", "provider": "relay-a", "model": "gpt-5", "timeout": 30,
+             "headers": {"X-Trace": "other"}, "temperature": 0.2},
+            # a complete standalone connection is fine — nothing to mix
+            {"id": "solo", "base_url": "https://solo.example/v1",
+             "api_key": "SOLO-KEY", "model": "m"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    moved = c.members["moved"]
+    assert moved.api_key != "SECRET-OF-RELAY-A", "relay-a's key leaked to another host"
+    assert not moved.enabled and c.get("moved") is None, "the mixed member is still reachable"
+    assert "mixes a provider" in moved.disabled_reason, moved.disabled_reason
+    assert any("disabled" in w and "moved" in w for w in c.warnings), c.warnings
+
+    assert c.members["ok"].api_key == "SECRET-OF-RELAY-A"     # normal path untouched
+    assert c.members["tuned"].timeout == 30                   # non-connection overrides kept
+    assert c.members["tuned"].headers == {"X-Trace": "other"}
+    assert c.members["tuned"].api_key == "SECRET-OF-RELAY-A"
+    assert c.members["solo"].configured and c.members["solo"].enabled
+    assert c.ids == ["ok", "tuned", "solo"], c.ids
+    print("ok  connection atomicity (a provider's key cannot follow another endpoint)")
+
+
 def test_shipped_example_is_valid() -> None:
     """The example we hand users must load cleanly — no warnings, no typos."""
     example = Path(__file__).resolve().parent.parent / "examples" / "config.json"
@@ -155,6 +209,7 @@ def main() -> None:
     test_default_roster()
     test_env_roster()
     test_file_config()
+    test_connection_is_atomic()
     test_shipped_example_is_valid()
     test_missing_file_falls_back()
     asyncio.run(test_tools())

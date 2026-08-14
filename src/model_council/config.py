@@ -42,6 +42,14 @@ _MEMBER_FIELDS = _PROVIDER_FIELDS | {
     "id", "model", "label", "max_tokens", "temperature", "enabled",
 }
 
+# Who you talk to, and how you prove who you are. These three travel together:
+# a member that names a provider may not override any of them, because taking
+# the key from one endpoint and the URL from another sends that key to a host it
+# was never issued for. A member with no provider supplies all three itself, so
+# nothing can be mixed. `headers` and `timeout` are not part of this identity
+# and stay overridable per member.
+_ATOMIC_CONNECTION = {"base_url", "api_key", "format"}
+
 
 # --------------------------------------------------------------------------- #
 # Minimal .env loader (no external dependency).
@@ -80,6 +88,7 @@ class Member:
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float = 180.0
     enabled: bool = True
+    disabled_reason: str = ""
 
     def __post_init__(self) -> None:
         self.label = self.label or self.id
@@ -211,12 +220,31 @@ def _from_file(path: Path) -> Council:
         provider_name = raw.get("provider")
         if provider_name and provider_name not in providers:
             warnings.append(f"member '{member_id}': unknown provider '{provider_name}'")
-        base = dict(providers.get(provider_name, {})) if provider_name else {}
         unknown = set(raw) - _MEMBER_FIELDS - {"provider"}
         if unknown:
             warnings.append(f"member '{member_id}': ignored unknown field(s) {sorted(unknown)}")
-        base.setdefault("timeout", default_timeout)
-        base.update({k: v for k, v in raw.items() if k in _MEMBER_FIELDS})
+
+        # A member that names a provider must take the whole connection from it.
+        # Refuse rather than merge: a half-overridden connection would quietly
+        # send one endpoint's credentials to another endpoint's host.
+        mixed = sorted(set(raw) & _ATOMIC_CONNECTION) if provider_name else []
+        if mixed:
+            warnings.append(
+                f"member '{member_id}': disabled — it uses provider '{provider_name}' but also "
+                f"sets {mixed}. base_url, api_key and format are one unit; overriding part of "
+                f"them would send '{provider_name}' credentials somewhere they were not issued "
+                f"for. Either drop {mixed}, or remove 'provider' and give this member its own "
+                f"complete connection."
+            )
+            base: dict = {k: v for k, v in raw.items()
+                          if k in _MEMBER_FIELDS and k not in _PROVIDER_FIELDS}
+            base["enabled"] = False
+            base["disabled_reason"] = "mixes a provider's connection with its own"
+        else:
+            base = dict(providers.get(provider_name, {})) if provider_name else {}
+            base.setdefault("timeout", default_timeout)
+            base.update({k: v for k, v in raw.items() if k in _MEMBER_FIELDS})
+
         if member_id in members:
             warnings.append(f"duplicate member id '{member_id}' — later one wins")
         members[member_id] = Member(**base)

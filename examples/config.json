@@ -18,6 +18,13 @@
       "base_url": "https://open.bigmodel.cn/api/anthropic",
       "api_key": "${GLM_KEY}",
       "format": "anthropic"
+    },
+    "internal": {
+      "$comment": "an endpoint your machine's proxy cannot reach — go direct",
+      "base_url": "https://gateway.internal.example/v1",
+      "api_key": "${INTERNAL_KEY}",
+      "format": "openai",
+      "proxy": false
     }
   },
 
@@ -33,6 +40,8 @@
       "api_key": "${KIMI_KEY}",
       "model": "kimi-k2"
     },
+
+    { "id": "inhouse", "provider": "internal", "model": "some-internal-model" },
 
     { "id": "spare", "provider": "my-relay", "model": "some-other-model", "enabled": false }
   ]

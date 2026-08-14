@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0
+
+**Requires the mcp 2.x SDK.** 2.0 removed `mcp.server.fastmcp` and replaced
+`FastMCP` with `MCPServer`; the server is written against the new class, and the
+dependency is now `mcp>=2,<3`. The tools, their arguments and the wire protocol
+are unchanged, so no configuration has to move. If you must stay on the 1.x SDK,
+pin `model-council-mcp==0.1.1`.
+
+**`model` is now a schema enum instead of a free string.** The ids this council
+has are built into the tool schema at startup, so a wrong one is rejected —
+with the valid values listed — before any tool body runs. The roster no longer
+has to be restated in the tool descriptions, which keeps them a fixed size no
+matter how many members you configure; `list_council` remains the place to look
+up what each member actually is.
+
+**New `proxy` field on providers and members.** Omit it to follow
+`HTTP_PROXY`/`HTTPS_PROXY` as before, set `false` to connect directly, or give a
+URL to route that member through a specific proxy. Without this, a member on a
+network the system proxy cannot reach — an internal gateway behind a VPN — fails
+with a bare `ConnectError` that never mentions a proxy. Connection errors now
+also say when a proxy is in play and what to do about it.
+
 ## 0.1.1
 
 **Security fix.** A member that named a `provider` and also overrode `base_url`

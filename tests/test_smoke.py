@@ -160,17 +160,59 @@ def test_connection_is_atomic() -> None:
     print("ok  connection atomicity (a provider's key cannot follow another endpoint)")
 
 
+def test_proxy_policy() -> None:
+    """A member can opt out of the environment's proxy, or name its own."""
+    from model_council.providers import _client
+
+    doc = {
+        "providers": {
+            "corp": {"base_url": "https://internal.example/v1", "api_key": "k",
+                     "proxy": False},
+        },
+        "members": [
+            {"id": "inherit", "base_url": "https://a.example/v1", "api_key": "k"},
+            {"id": "internal", "provider": "corp", "model": "m"},
+            {"id": "viaproxy", "provider": "corp", "model": "m",
+             "proxy": "http://127.0.0.1:8888"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    assert c.members["inherit"].proxy is None      # omitted: follow the environment
+    assert c.members["internal"].proxy is False    # inherited from the provider
+    assert c.members["viaproxy"].proxy == "http://127.0.0.1:8888"   # per-member override
+    assert not c.warnings, c.warnings              # proxy is not part of the atomic set
+
+    # the client actually reflects the policy
+    assert _client(c.members["internal"]).trust_env is False
+    assert _client(c.members["inherit"]).trust_env is True
+
+    # and via environment variables
+    with env(COUNCIL_MODELS="a,b", A_PROXY="direct", B_PROXY="http://p:3128"):
+        e = cfg.load_council()
+    assert e.members["a"].proxy is False
+    assert e.members["b"].proxy == "http://p:3128"
+    print("ok  proxy policy (inherit / direct / explicit, config and env)")
+
+
 def test_shipped_example_is_valid() -> None:
     """The example we hand users must load cleanly — no warnings, no typos."""
     example = Path(__file__).resolve().parent.parent / "examples" / "config.json"
     if not example.exists():
         print("--  skipped shipped-example check (examples/ not present)")
         return
-    with env(COUNCIL_CONFIG=str(example), MY_RELAY_KEY="sk-a", GLM_KEY="sk-g", KIMI_KEY="sk-k"):
+    with env(COUNCIL_CONFIG=str(example), MY_RELAY_KEY="sk-a", GLM_KEY="sk-g",
+             KIMI_KEY="sk-k", INTERNAL_KEY="sk-i"):
         c = cfg.load_council()
     assert not c.warnings, c.warnings
-    assert c.ids == ["gpt5", "codex", "glm", "kimi"], c.ids   # 'spare' is disabled
+    assert c.ids == ["gpt5", "codex", "glm", "kimi", "inhouse"], c.ids  # 'spare' is disabled
     assert all(c.members[i].configured for i in c.ids), c.members
+    assert c.members["inhouse"].proxy is False        # inherited from its provider
+    assert c.members["gpt5"].proxy is None            # everyone else follows the env
     print("ok  examples/config.json loads with no warnings")
 
 
@@ -188,11 +230,17 @@ async def test_tools() -> None:
     names = sorted(t.name for t in await s.mcp.list_tools())
     assert names == ["ask", "ask_all", "list_council", "probe_models"], names
 
+    # The roster is a schema constraint, not a suggestion in the prose: a wrong
+    # id is rejected by validation before any tool body runs.
     tools = {t.name: t for t in await s.mcp.list_tools()}
-    assert "Available ids:" in (tools["ask"].description or "")
+    model_schema = tools["ask"].input_schema["properties"]["model"]
+    assert model_schema.get("enum") == s.COUNCIL.ids, model_schema
+    subset = tools["ask_all"].input_schema["properties"]["models"]
+    assert any(o.get("items", {}).get("enum") == s.COUNCIL.ids
+               for o in subset["anyOf"]), subset
 
     bad = await s.ask(model="does-not-exist", prompt="hi")
-    assert "unknown model id" in bad, bad
+    assert "unknown model id" in bad, bad      # the fallback path still holds
 
     print("ok  tool surface:", names)
     print()
@@ -210,6 +258,7 @@ def main() -> None:
     test_env_roster()
     test_file_config()
     test_connection_is_atomic()
+    test_proxy_policy()
     test_shipped_example_is_valid()
     test_missing_file_falls_back()
     asyncio.run(test_tools())

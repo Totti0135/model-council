@@ -1,6 +1,6 @@
 [project]
 name = "model-council-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "An MCP server that lets your assistant consult other LLMs — ask them, compare their answers, and synthesize a conclusion."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,9 +18,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    # mcp 2.0 removed mcp.server.fastmcp and replaced FastMCP with MCPServer,
-    # so the 1.x line is what this server targets until it is migrated.
-    "mcp>=1.2.0,<2",
+    # 2.x only: FastMCP is gone, and the server is written against MCPServer.
+    "mcp>=2,<3",
     "httpx>=0.27.0",
 ]
 

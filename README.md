@@ -100,7 +100,7 @@ GLM_FORMAT=anthropic
 ```
 
 Per member: `_BASE_URL`, `_API_KEY`, `_MODEL`, `_FORMAT`, `_LABEL`, `_MAX_TOKENS`,
-`_TEMPERATURE`, `_TIMEOUT`, `_HEADERS` (a JSON object), `_ENABLED`.
+`_TEMPERATURE`, `_TIMEOUT`, `_HEADERS` (a JSON object), `_PROXY`, `_ENABLED`.
 Globally: `COUNCIL_TIMEOUT`, `COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`.
 
 Omit `COUNCIL_MODELS` and the roster defaults to `chatgpt,glm`, reading
@@ -165,6 +165,7 @@ The first three travel together as one unit — see the rule above.
 | `temperature` | member | Sent only when set |
 | `headers` | provider, member | Extra HTTP headers |
 | `timeout` | provider, member | Seconds. Default 180 |
+| `proxy` | provider, member | Omit to follow `HTTP_PROXY`/`HTTPS_PROXY`; `false` to connect directly; a URL to use that proxy |
 | `enabled` | member | `false` parks a member without deleting its config |
 
 ### Wire format notes
@@ -178,6 +179,11 @@ The first three travel together as one unit — see the rule above.
 - **OpenAI-compatible endpoints:** the server uses `/chat/completions`, never
   `/responses`. Some gateways expose both, but `/responses` may inject a
   provider-chosen system persona, which is wrong for a general-purpose advisor.
+- **A system proxy is followed by default.** If a member sits on a network your
+  proxy cannot reach — an internal gateway, typically — it fails with a bare
+  `ConnectError` that never mentions a proxy. Give that member or provider
+  `"proxy": false` and it connects directly, while everyone else keeps using the
+  proxy. The error message says so too when a proxy is in play.
 - **Model ids move fast.** Run `probe_models` to see what an endpoint actually
   offers today.
 

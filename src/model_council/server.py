@@ -11,15 +11,23 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
+from model_council import __version__
 from model_council.config import Member, load_council
 from model_council.providers import ask_member, probe_member
 
 COUNCIL = load_council()
 
-mcp = FastMCP("model-council")
+# Constrain `model` to the ids this install actually has, so the caller cannot
+# invent one: the schema carries an enum, and a wrong value is rejected with the
+# valid values listed before it ever reaches a tool body. An empty roster has no
+# valid values at all, and Literal[()] is not a type, so it falls back to str.
+ModelId = Literal[tuple(COUNCIL.ids)] if COUNCIL.ids else str  # type: ignore[valid-type]
+
+mcp = MCPServer("model-council", version=__version__)
 
 
 def _roster() -> str:
@@ -41,33 +49,38 @@ def _labelled(m: Member, answer: str) -> str:
 # --------------------------------------------------------------------------- #
 # MCP tools
 #
-# The roster is injected into the descriptions at startup, so the model sees the
-# ids it may actually pass without having to call list_council first.
+# The valid ids live in the `model` schema as an enum, not in the prose, so they
+# are stated once and enforced rather than merely suggested. What each member
+# actually is — endpoint, wire format, whether it is ready — belongs in
+# list_council, which the caller reads only when it needs to choose.
 # --------------------------------------------------------------------------- #
-@mcp.tool(description=f"""Ask ONE member of the council a question and return its answer.
+@mcp.tool(description="""Ask ONE member of the council a question and return its answer.
 
-`model` is the member's short id. Available ids: {_roster()}
+`model` is the member's short id; the schema lists the ones this council has, and
+`list_council` describes them.
 
 The member is stateless and cannot see this conversation, so `prompt` must carry
 everything it needs — including any other model's answer you want it to critique.
 Optionally set `system` to steer its role or output format.""")
-async def ask(model: str, prompt: str, system: str | None = None) -> str:
+async def ask(model: ModelId, prompt: str, system: str | None = None) -> str:  # type: ignore[valid-type]
+    # The enum normally rejects a bad id before we get here; this covers the
+    # unconstrained fallback when no members are configured.
     m = COUNCIL.get(model)
     if m is None:
         return _unknown([model])
     return await ask_member(m, prompt, system)
 
 
-@mcp.tool(description=f"""Ask several members the SAME prompt in parallel, returning
+@mcp.tool(description="""Ask several members the SAME prompt in parallel, returning
 their answers side by side and labeled by model.
 
 By default every configured member answers. Pass `models` to ask only some of
-them. Available ids: {_roster()}
+them; the schema lists the valid ids.
 
 Use this for the first round of a multi-model question. Afterwards you can
 compare the answers yourself, or feed them back through `ask` so each member
 revises its answer in light of the others.""")
-async def ask_all(prompt: str, models: list[str] | None = None,
+async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ignore[valid-type]
                   system: str | None = None) -> str:
     members, unknown = COUNCIL.resolve(models)
     if not members:
@@ -101,15 +114,14 @@ async def list_council() -> str:
     return "\n".join(out)
 
 
-@mcp.tool(description=f"""Ask a member's endpoint which model ids it actually exposes,
+@mcp.tool(description="""Ask a member's endpoint which model ids it actually exposes,
 by calling its /models route.
 
 Pass `model` to probe one member, or omit it to probe every configured member.
-Available ids: {_roster()}
 
 Use this when a call fails with an unknown-model error, or to discover what else
 a provider offers — model ids move fast.""")
-async def probe_models(model: str | None = None) -> str:
+async def probe_models(model: ModelId | None = None) -> str:  # type: ignore[valid-type]
     members, unknown = COUNCIL.resolve([model] if model else None)
     if not members:
         return _unknown(unknown) if unknown else "[no council members are configured]"

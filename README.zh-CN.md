@@ -84,7 +84,7 @@ GLM_MODEL=glm-4.6
 GLM_FORMAT=anthropic
 ```
 
-每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_HEADERS`（JSON 对象）、`_ENABLED`。
+每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_HEADERS`（JSON 对象）、`_PROXY`、`_ENABLED`。
 全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`。
 
 不设 `COUNCIL_MODELS` 时，花名册默认是 `chatgpt,glm`，分别读 `CHATGPT_*` 和 `GLM_*`。
@@ -136,6 +136,7 @@ GLM_FORMAT=anthropic
 | `temperature` | member | 只在设置了的时候才发送 |
 | `headers` | provider、member | 额外的 HTTP 头 |
 | `timeout` | provider、member | 秒。默认 180 |
+| `proxy` | provider、member | 省略则跟随 `HTTP_PROXY`/`HTTPS_PROXY`；`false` 表示直连；填 URL 则走该代理 |
 | `enabled` | member | `false` 可以临时停用某个成员而不删配置 |
 
 ### 协议注意事项
@@ -143,6 +144,7 @@ GLM_FORMAT=anthropic
 - **`format` 不会从 URL 推断。** 把 `base_url` 指向 Anthropic 风格的端点却没同时设 `format: "anthropic"`，成员仍然停留在 OpenAI 协议上，每次调用都会失败。**这是最常见的配置错误。**
 - **Anthropic 端点：** 服务器会拼 `{base_url}/v1/messages`，所以 `base_url` 里不要已经带上 `/v1`。
 - **OpenAI 兼容端点：** 服务器只用 `/chat/completions`，不用 `/responses`。有些网关两个都提供，但 `/responses` 可能注入供应方指定的系统人格，对一个通用顾问模型来说是错的。
+- **系统代理默认会被沿用。** 如果某个成员在代理到不了的网络上（典型是内网网关），它会以一个光秃秃的 `ConnectError` 失败，字面上完全看不出跟代理有关。给那个成员或 provider 加 `"proxy": false` 就直连，其余成员照旧走代理。当环境里确实有代理时，错误信息也会主动提示这一点。
 - **模型 id 变得很快。** 用 `probe_models` 看看某个端点今天到底提供什么。
 
 ## 怎么用

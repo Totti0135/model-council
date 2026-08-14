@@ -37,7 +37,7 @@ LEGACY_DEFAULTS: dict[str, dict] = {
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 # Connection fields a member may inherit from its provider.
-_PROVIDER_FIELDS = {"base_url", "api_key", "format", "headers", "timeout"}
+_PROVIDER_FIELDS = {"base_url", "api_key", "format", "headers", "timeout", "proxy"}
 _MEMBER_FIELDS = _PROVIDER_FIELDS | {
     "id", "model", "label", "max_tokens", "temperature", "enabled",
 }
@@ -47,7 +47,9 @@ _MEMBER_FIELDS = _PROVIDER_FIELDS | {
 # the key from one endpoint and the URL from another sends that key to a host it
 # was never issued for. A member with no provider supplies all three itself, so
 # nothing can be mixed. `headers` and `timeout` are not part of this identity
-# and stay overridable per member.
+# and stay overridable per member, and neither is `proxy`: it changes the route
+# to the host, not which host or which credential, and over TLS a proxy sees
+# only a CONNECT tunnel.
 _ATOMIC_CONNECTION = {"base_url", "api_key", "format"}
 
 
@@ -87,6 +89,9 @@ class Member:
     temperature: float | None = None
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float = 180.0
+    # None = follow the environment's proxy settings (the default);
+    # False = connect directly, ignoring them; a URL = use that proxy.
+    proxy: str | bool | None = None
     enabled: bool = True
     disabled_reason: str = ""
 
@@ -147,6 +152,18 @@ def _env_json(name: str) -> dict:
         return {}
 
 
+_DIRECT = {"false", "0", "no", "off", "none", "direct"}
+
+
+def _env_proxy(prefix: str) -> str | bool | None:
+    """`<ID>_PROXY`: unset = follow the environment, a falsey word = go direct,
+    anything else = the proxy URL to use."""
+    raw = os.environ.get(f"{prefix}_PROXY", "").strip()
+    if not raw:
+        return None
+    return False if raw.lower() in _DIRECT else raw
+
+
 def _member_from_env(member_id: str, defaults: dict, default_timeout: float) -> Member:
     p = _prefix(member_id)
     temp = os.environ.get(f"{p}_TEMPERATURE", "").strip()
@@ -161,6 +178,7 @@ def _member_from_env(member_id: str, defaults: dict, default_timeout: float) -> 
         temperature=float(temp) if temp else None,
         headers=_env_json(f"{p}_HEADERS"),
         timeout=float(os.environ.get(f"{p}_TIMEOUT", str(default_timeout))),
+        proxy=_env_proxy(p),
         enabled=os.environ.get(f"{p}_ENABLED", "1").lower() not in ("0", "false", "no"),
     )
 

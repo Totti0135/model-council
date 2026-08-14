@@ -1,5 +1,7 @@
 # Model Council
 
+<!-- mcp-name: io.github.Totti0135/model-council -->
+
 English | [简体中文](README.zh-CN.md)
 
 An MCP server that seats other LLMs at your table. Your assistant asks them,

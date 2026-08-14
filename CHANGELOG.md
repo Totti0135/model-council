@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+Listed on the official MCP Registry as `io.github.Totti0135/model-council`, so
+clients that browse the registry can find the server instead of being told about
+it. No code changes: this adds `server.json`, the `mcp-name` ownership marker the
+registry reads out of the PyPI README, and a release job that publishes the
+listing after the PyPI upload is visible.
+
 ## 0.2.0
 
 **Requires the mcp 2.x SDK.** 2.0 removed `mcp.server.fastmcp` and replaced

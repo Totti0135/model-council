@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Totti0135/model-council",
+  "title": "Model Council",
+  "description": "Consult other LLMs as tools — ask them, compare their answers, synthesize a conclusion.",
+  "repository": {
+    "url": "https://github.com/Totti0135/model-council",
+    "source": "github"
+  },
+  "version": "0.2.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "model-council-mcp",
+      "version": "0.2.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "COUNCIL_MODELS",
+          "description": "Comma-separated short ids for the models to seat, e.g. 'gpt5,glm'. Each id then takes its own <ID>_BASE_URL, <ID>_API_KEY, <ID>_MODEL and optional <ID>_FORMAT (openai or anthropic). Omit to use a config file instead.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "COUNCIL_CONFIG",
+          "description": "Path to a JSON config file, for rosters large enough that several models share one endpoint. Defaults to ~/.config/model-council/config.json when that exists.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}

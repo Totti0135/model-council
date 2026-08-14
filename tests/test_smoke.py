@@ -199,6 +199,33 @@ def test_proxy_policy() -> None:
     print("ok  proxy policy (inherit / direct / explicit, config and env)")
 
 
+def test_registry_metadata_agrees() -> None:
+    """server.json must name the same server the README claims ownership of.
+
+    The registry verifies ownership by finding `mcp-name: <name>` in the README
+    that PyPI shows; if the two ever disagree, publishing fails after the PyPI
+    upload has already happened, which is the worst moment to find out.
+    """
+    root = Path(__file__).resolve().parent.parent
+    server_json = root / "server.json"
+    if not server_json.exists():
+        print("--  skipped registry metadata check (server.json not present)")
+        return
+    doc = json.loads(server_json.read_text(encoding="utf-8"))
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    version = next(l.split('"')[1] for l in
+                   (root / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+                   if l.startswith("version = "))
+
+    assert f"mcp-name: {doc['name']}" in readme, "README is missing the ownership marker"
+    assert doc["version"] == version, (doc["version"], version)
+    pkg = doc["packages"][0]
+    assert pkg["version"] == version, (pkg["version"], version)
+    assert pkg["registryType"] == "pypi" and pkg["identifier"] == "model-council-mcp", pkg
+    assert len(doc["description"]) <= 100, len(doc["description"])
+    print("ok  registry metadata (server.json, README marker and version agree)")
+
+
 def test_shipped_example_is_valid() -> None:
     """The example we hand users must load cleanly — no warnings, no typos."""
     example = Path(__file__).resolve().parent.parent / "examples" / "config.json"
@@ -259,6 +286,7 @@ def main() -> None:
     test_file_config()
     test_connection_is_atomic()
     test_proxy_policy()
+    test_registry_metadata_agrees()
     test_shipped_example_is_valid()
     test_missing_file_falls_back()
     asyncio.run(test_tools())

@@ -1,5 +1,7 @@
 # Model Council
 
+English | [简体中文](README.zh-CN.md)
+
 An MCP server that seats other LLMs at your table. Your assistant asks them,
 reads their answers as tool results, relays those answers back and forth for
 critique, and gives you one merged conclusion — inside a single normal

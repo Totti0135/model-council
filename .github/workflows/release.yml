@@ -1,0 +1,61 @@
+name: Release
+
+# Publishes to PyPI when a v* tag is pushed. Authentication is PyPI Trusted
+# Publishing: GitHub mints a short-lived OIDC token proving the build really
+# came from this repo, so no API token is stored anywhere.
+#
+# One-time setup on PyPI (Your projects -> Publishing, or the "pending
+# publisher" form for a project that does not exist yet):
+#   owner: Totti0135   repository: model-council
+#   workflow: release.yml   environment: pypi
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync
+      - name: Smoke test
+        run: uv run python tests/test_smoke.py
+        env:
+          # Never pick up a stray .env on the runner: this run must stay offline.
+          COUNCIL_ENV_FILE: /nonexistent
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/model-council-mcp
+    permissions:
+      id-token: write # required to mint the OIDC token PyPI verifies
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Verify the tag matches the packaged version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v${tag} does not match pyproject.toml version ${version}"
+            exit 1
+          fi
+          echo "publishing ${version}"
+
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

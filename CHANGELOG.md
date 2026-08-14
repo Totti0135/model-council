@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+**Ships as a desktop extension.** `model-council-<version>.mcpb` is attached to
+each GitHub release; Claude Desktop installs it in one click and collects the
+endpoints and keys through its own form, so the keys go to the OS keychain
+rather than sitting in plaintext in a config file. The bundle uses the MCPB `uv`
+runtime, so it is ~17 kB and needs no Python on the machine — dependencies are
+resolved on the host from `pyproject.toml`. The form configures two seats;
+point its "Config file" field at a JSON config for anything larger.
+
+**Behaviour change: explicit configuration now beats a discovered file.** The
+order is COUNCIL_CONFIG, then COUNCIL_MODELS, then a config file at the default
+path, then the built-in roster. Previously a file at
+`~/.config/model-council/config.json` won even when the client had passed
+COUNCIL_MODELS, which made the extension's form look broken: you fill it in,
+nothing you typed takes effect, and nothing says why. If you relied on a
+discovered file overriding an environment roster, unset COUNCIL_MODELS or point
+COUNCIL_CONFIG at the file.
+
 ## 0.2.1
 
 Listed on the official MCP Registry as `io.github.Totti0135/model-council`, so

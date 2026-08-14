@@ -1,0 +1,22 @@
+# The uv server type installs dependencies from pyproject.toml on the host, so
+# nothing resolved locally belongs in the bundle.
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+uv.lock
+dist/
+build/
+
+# Repository furniture the bundle does not need.
+.git/
+.github/
+.gitignore
+.env
+.env.example
+tests/
+server.json
+CHANGELOG.md
+README.zh-CN.md
+examples/

@@ -1,0 +1,129 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "model-council",
+  "display_name": "Model Council",
+  "version": "0.3.0",
+  "description": "Consult other LLMs as tools — ask them, compare their answers, synthesize a conclusion.",
+  "long_description": "Seats other LLMs at your table as tools, so your assistant can ask them, relay their answers back and forth for critique, and give you one merged conclusion — inside a single conversation, with no copy-paste.\n\nThe form below configures two seats, which is the smallest council worth having. Each takes an endpoint, a key, a model id, and which wire format that endpoint speaks: `openai` for anything OpenAI-compatible, `anthropic` for the Messages format. Setting the URL of an Anthropic-style endpoint without also setting the format is the one mistake that reliably breaks a seat.\n\nFor more than two members, or for several models sharing one endpoint and one key, point \"Config file\" at a JSON config instead; it takes precedence over the fields above. The project README documents its shape.",
+  "author": {
+    "name": "qinsisheng",
+    "url": "https://github.com/Totti0135"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Totti0135/model-council"
+  },
+  "homepage": "https://github.com/Totti0135/model-council",
+  "documentation": "https://github.com/Totti0135/model-council#readme",
+  "support": "https://github.com/Totti0135/model-council/issues",
+  "license": "MIT",
+  "keywords": ["mcp", "llm", "openai", "anthropic", "multi-model", "council"],
+
+  "server": {
+    "type": "uv",
+    "entry_point": "src/model_council/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "python", "-m", "model_council"],
+      "env": {
+        "COUNCIL_MODELS": "${user_config.council_models}",
+        "COUNCIL_CONFIG": "${user_config.config_file}",
+
+        "FIRST_BASE_URL": "${user_config.first_base_url}",
+        "FIRST_API_KEY": "${user_config.first_api_key}",
+        "FIRST_MODEL": "${user_config.first_model}",
+        "FIRST_FORMAT": "${user_config.first_format}",
+
+        "SECOND_BASE_URL": "${user_config.second_base_url}",
+        "SECOND_API_KEY": "${user_config.second_api_key}",
+        "SECOND_MODEL": "${user_config.second_model}",
+        "SECOND_FORMAT": "${user_config.second_format}"
+      }
+    }
+  },
+
+  "user_config": {
+    "first_base_url": {
+      "type": "string",
+      "title": "First model — endpoint",
+      "description": "Root URL the API hangs off, usually ending in /v1 for OpenAI-compatible hosts. For an Anthropic-format endpoint, leave the /v1 off.",
+      "required": true
+    },
+    "first_api_key": {
+      "type": "string",
+      "title": "First model — API key",
+      "description": "Stored by the app, not written into a config file.",
+      "sensitive": true,
+      "required": true
+    },
+    "first_model": {
+      "type": "string",
+      "title": "First model — model id",
+      "description": "The id sent to that endpoint, e.g. gpt-5. Ask the assistant to run probe_models later if you are unsure what the endpoint offers.",
+      "required": true
+    },
+    "first_format": {
+      "type": "string",
+      "title": "First model — wire format",
+      "description": "openai for OpenAI-compatible endpoints, anthropic for the Anthropic Messages format.",
+      "default": "openai",
+      "required": false
+    },
+
+    "second_base_url": {
+      "type": "string",
+      "title": "Second model — endpoint",
+      "description": "Leave the second seat empty to start with one model; it will simply report as not configured.",
+      "required": false
+    },
+    "second_api_key": {
+      "type": "string",
+      "title": "Second model — API key",
+      "description": "Stored by the app, not written into a config file.",
+      "sensitive": true,
+      "required": false
+    },
+    "second_model": {
+      "type": "string",
+      "title": "Second model — model id",
+      "description": "The id sent to that endpoint, e.g. glm-4.6.",
+      "required": false
+    },
+    "second_format": {
+      "type": "string",
+      "title": "Second model — wire format",
+      "description": "openai or anthropic.",
+      "default": "openai",
+      "required": false
+    },
+
+    "council_models": {
+      "type": "string",
+      "title": "Seats to enable",
+      "description": "Comma-separated ids of the seats to seat. Leave as is for both; set to just 'first' if you are only using one.",
+      "default": "first,second",
+      "required": false
+    },
+    "config_file": {
+      "type": "file",
+      "title": "Config file (optional)",
+      "description": "A JSON config, for councils larger than two or for several models sharing one endpoint. Takes precedence over the fields above. See the project README for its shape.",
+      "required": false
+    }
+  },
+
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+
+  "tools": [
+    { "name": "ask", "description": "Ask one member of the council a question." },
+    { "name": "ask_all", "description": "Ask several members the same prompt in parallel." },
+    { "name": "list_council", "description": "List the members, their endpoints, and whether each is ready." },
+    { "name": "probe_models", "description": "Ask an endpoint which model ids it actually exposes." }
+  ]
+}

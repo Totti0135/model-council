@@ -41,9 +41,17 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Claude Desktop
 
-Edit `claude_desktop_config.json` (Settings → Developer → Edit Config), add the
-block below, then **fully quit and reopen** the app — Cmd-Q, not just closing
-the window. You will know it worked when the tools menu lists `model-council`.
+Easiest is the desktop extension. Download `model-council-<version>.mcpb` from
+the [latest release](https://github.com/Totti0135/model-council/releases/latest)
+and drag it onto Settings → Extensions. The app asks for the endpoints and keys
+in a form and keeps the keys in your OS keychain, so no file on disk holds them.
+The form seats two models; for a larger council, point its "Config file" field
+at a JSON config (see below).
+
+To wire it up by hand instead, edit `claude_desktop_config.json`
+(Settings → Developer → Edit Config), add the block below, then **fully quit and
+reopen** the app — Cmd-Q, not just closing the window. You will know it worked
+when the tools menu lists `model-council`.
 
 ```json
 {
@@ -85,8 +93,12 @@ credentials:
 - **provider** — an endpoint: `base_url` + `api_key` + which wire format it speaks
 - **member** — one model on some provider, addressed by a short id
 
-Configuration comes from a JSON file if one is found, otherwise from environment
-variables. `list_council()` always reports which source won.
+Configuration comes from whichever source is most explicit: the file
+`COUNCIL_CONFIG` points at, else the roster `COUNCIL_MODELS` names, else a config
+file at `~/.config/model-council/config.json`, else the built-in default roster.
+Explicit beats discovered on purpose — a config file you left lying around must
+not silently override settings a client just handed the server.
+`list_council()` always reports which source won.
 
 ### Environment variables
 

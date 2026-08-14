@@ -29,7 +29,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Claude Desktop
 
-编辑 `claude_desktop_config.json`（设置 → 开发者 → 编辑配置），加入下面这段，然后**完全退出并重开**应用 —— Cmd-Q，不是关窗口。工具菜单里出现 `model-council` 就说明成了。
+最省事的是桌面扩展。从 [最新 release](https://github.com/Totti0135/model-council/releases/latest) 下载 `model-council-<版本>.mcpb`，拖到 设置 → 扩展 里即可。应用会用表单向你索取端点和密钥，并把密钥存进系统钥匙串 —— 磁盘上不会有任何文件保存它们。表单提供两个座位；想要更大的议会，把表单里的 "Config file" 指向一份 JSON 配置（见下文）。
+
+想手动配置就编辑 `claude_desktop_config.json`（设置 → 开发者 → 编辑配置），加入下面这段，然后**完全退出并重开**应用 —— Cmd-Q，不是关窗口。工具菜单里出现 `model-council` 就说明成了。
 
 ```json
 {
@@ -69,7 +71,7 @@ claude mcp add model-council -e GPT5_BASE_URL=... -e GPT5_API_KEY=... -- uvx mod
 - **provider（供应方）** —— 一个端点：`base_url` + `api_key` + 它说哪种协议
 - **member（成员）** —— 某个 provider 上的一个具体模型，用一个短 id 称呼
 
-配置优先从 JSON 文件读，找不到就读环境变量。`list_council()` 会明确告诉你实际用的是哪一个，不用猜。
+配置取自"最显式"的那个来源：`COUNCIL_CONFIG` 指向的文件 → `COUNCIL_MODELS` 声明的花名册 → `~/.config/model-council/config.json` → 内置默认花名册。显式压过自动发现是有意为之 —— 一份你随手留下的配置文件，不该静默覆盖客户端刚刚传进来的设置。`list_council()` 会明确告诉你实际用的是哪一个，不用猜。
 
 ### 用环境变量
 

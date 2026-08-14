@@ -217,6 +217,10 @@ def test_registry_metadata_agrees() -> None:
                    (root / "pyproject.toml").read_text(encoding="utf-8").splitlines()
                    if l.startswith("version = "))
 
+    manifest = root / "manifest.json"
+    if manifest.exists():   # the desktop-extension bundle ships the same version
+        assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == version
+
     assert f"mcp-name: {doc['name']}" in readme, "README is missing the ownership marker"
     assert doc["version"] == version, (doc["version"], version)
     pkg = doc["packages"][0]
@@ -241,6 +245,45 @@ def test_shipped_example_is_valid() -> None:
     assert c.members["inhouse"].proxy is False        # inherited from its provider
     assert c.members["gpt5"].proxy is None            # everyone else follows the env
     print("ok  examples/config.json loads with no warnings")
+
+
+def test_explicit_beats_discovered() -> None:
+    """A roster passed by the client must not be shadowed by a stray config file.
+
+    Someone who fills in a desktop-extension form while an old
+    ~/.config/model-council/config.json is still lying around should get what
+    they typed, not the leftover file, and with no way to tell from the outside.
+    """
+    doc = {"members": [{"id": "leftover", "base_url": "https://old.example/v1",
+                        "api_key": "k", "model": "m"}]}
+    with tempfile.TemporaryDirectory() as d:
+        discovered = Path(d) / "config.json"
+        discovered.write_text(json.dumps(doc), encoding="utf-8")
+
+        # discovered file wins when nothing more explicit is given
+        with env():
+            cfg.DEFAULT_CONFIG_PATH = discovered
+            c = cfg.load_council()
+        assert c.ids == ["leftover"], c.ids
+
+        # an explicit roster beats it
+        with env(COUNCIL_MODELS="typed", TYPED_BASE_URL="https://new.example/v1",
+                 TYPED_API_KEY="k", TYPED_MODEL="m"):
+            cfg.DEFAULT_CONFIG_PATH = discovered
+            c = cfg.load_council()
+        assert c.ids == ["typed"], c.ids
+        assert "environment" in c.source, c.source
+
+        # an explicit file beats both
+        other = Path(d) / "other.json"
+        other.write_text(json.dumps(
+            {"members": [{"id": "pointed", "base_url": "https://p.example/v1",
+                          "api_key": "k", "model": "m"}]}), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(other), COUNCIL_MODELS="typed"):
+            cfg.DEFAULT_CONFIG_PATH = discovered
+            c = cfg.load_council()
+        assert c.ids == ["pointed"], c.ids
+    print("ok  source precedence (explicit config beats a discovered file)")
 
 
 def test_missing_file_falls_back() -> None:
@@ -287,6 +330,7 @@ def main() -> None:
     test_connection_is_atomic()
     test_proxy_policy()
     test_registry_metadata_agrees()
+    test_explicit_beats_discovered()
     test_shipped_example_is_valid()
     test_missing_file_falls_back()
     asyncio.run(test_tools())

@@ -8,10 +8,12 @@ The abstraction has two layers:
 One provider can host many members (a relay that exposes several models), and a
 member may inline its own connection details instead of naming a provider.
 
-Configuration arrives from one of two places, in this order:
+Configuration arrives from whichever of these is most explicit:
 
-  1. a JSON file, if COUNCIL_CONFIG points at one or the default path exists
-  2. environment variables, which is how MCP clients pass config to a server
+  1. the JSON file COUNCIL_CONFIG points at
+  2. environment variables, if COUNCIL_MODELS names a roster
+  3. a JSON file found at the default path
+  4. the built-in default roster, read from environment variables
 
 The chosen source is reported by the `list_council` tool, so it is never a
 mystery which one won.
@@ -271,6 +273,15 @@ def _from_file(path: Path) -> Council:
 
 
 def _config_path() -> tuple[Path | None, list[str]]:
+    """Which source wins, most explicit first.
+
+    A pointer to a file beats a roster in the environment, which beats a file
+    the server merely happened to find, which beats the built-in default. The
+    middle rule matters: a client that passes COUNCIL_MODELS means it, and
+    quietly preferring a leftover ~/.config file over what the client just
+    supplied is impossible to diagnose from the outside — you fill in a form,
+    nothing you typed takes effect, and nothing says why.
+    """
     explicit = os.environ.get("COUNCIL_CONFIG", "").strip()
     if explicit:
         p = Path(explicit).expanduser()
@@ -278,6 +289,8 @@ def _config_path() -> tuple[Path | None, list[str]]:
             return p, []
         return None, [f"COUNCIL_CONFIG points at {p}, which does not exist "
                       f"— fell back to environment variables"]
+    if os.environ.get("COUNCIL_MODELS", "").strip():
+        return None, []
     if DEFAULT_CONFIG_PATH.exists():
         return DEFAULT_CONFIG_PATH, []
     return None, []

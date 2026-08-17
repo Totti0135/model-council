@@ -65,6 +65,19 @@
       "retries": 1
     },
 
+    {
+      "$comment": [
+        "A seat with no endpoint and no key: the MCP client answers it with its own",
+        "model. Needs a client that supports sampling, and stdio — not --http, which",
+        "is stateless and has no way back to the client. Its answer is not an outside",
+        "opinion, and ask_all says so. See the README."
+      ],
+      "id": "sub",
+      "format": "sampling",
+      "label": "Subagent",
+      "enabled": false
+    },
+
     { "id": "spare", "provider": "my-relay", "model": "some-other-model", "enabled": false }
   ]
 }

@@ -8,6 +8,9 @@ The abstraction has two layers:
 One provider can host many members (a relay that exposes several models), and a
 member may inline its own connection details instead of naming a provider.
 
+A member with `format: "sampling"` has no endpoint at all: it is answered by the
+MCP client's own model, back down the session that is already open.
+
 Configuration arrives from whichever of these is most explicit:
 
   1. the JSON file COUNCIL_CONFIG points at
@@ -54,6 +57,12 @@ _MAX_RETRIES = 5
 # endpoint. Only ratios mean anything, and the ceiling keeps one member from
 # being given a number so large that every other answer rounds to noise.
 _MAX_WEIGHT = 10.0
+
+# The third way to reach a model, alongside the two HTTP formats: don't. A
+# member with this format is answered by the MCP client's own model, over the
+# session it already has open, via a `sampling/createMessage` request back down
+# the connection. It needs no endpoint, no key, and nothing to pay for.
+SAMPLING = "sampling"
 
 # Who you talk to, and how you prove who you are. These three travel together:
 # a member that names a provider may not override any of them, because taking
@@ -148,7 +157,16 @@ class Member:
         return not self.missing
 
     @property
+    def is_sampling(self) -> bool:
+        return self.format == SAMPLING
+
+    @property
     def missing(self) -> list[str]:
+        # A sampling member rides the MCP session that is already open, so there
+        # is no endpoint to point at and no key to present. `model` is only ever
+        # a hint to the client, which is free to ignore it.
+        if self.is_sampling:
+            return []
         return [f for f in ("base_url", "api_key", "model") if not getattr(self, f)]
 
 

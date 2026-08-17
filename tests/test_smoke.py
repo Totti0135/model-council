@@ -293,7 +293,7 @@ async def test_weights_reach_the_reader_not_the_members() -> None:
     alpha, beta = member("alpha", weight=3), member("beta", weight=0.5)
     prompts: list[str] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, session=None):
         prompts.append(prompt)
         return Answer(m, f"{m.label} says so", ok=True)
 
@@ -320,6 +320,133 @@ async def test_weights_reach_the_reader_not_the_members() -> None:
     finally:
         s.COUNCIL, s.ask_member = saved
     print("ok  weights (labeled for the caller, never shown to the members)")
+
+
+async def test_sampling_seat() -> None:
+    """A seat with no endpoint, answered by the MCP client's own model.
+
+    Driven through a real client/server pair over memory streams rather than a
+    stub, because the whole feature is a request travelling back up a live MCP
+    session: a mock of `create_message` would prove only that we can call our
+    own code. `_lowlevel_server` is private, but it is what `run_stdio_async`
+    drives, and it is the only way to run the server on streams we hold.
+    """
+    import anyio
+    import mcp_types as types
+    from mcp.client.session import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    from model_council import server as s
+
+    sub = cfg.Member(id="sub", format="sampling", label="Subagent")
+    assert sub.is_sampling
+    assert sub.configured and sub.missing == [], "a sampling seat needs no url and no key"
+
+    asked: list[str] = []
+
+    async def as_subagent(context, params):
+        asked.append(params.messages[0].content.text)
+        return types.CreateMessageResult(
+            role="assistant",
+            content=types.TextContent(type="text", text=f"Subagent answer {len(asked)}"),
+            model="client-side-model")
+
+    async def call(tool: str, args: dict, council: dict, **client_kw) -> str:
+        saved = s.COUNCIL
+        s.COUNCIL = cfg.Council(council, "test")
+        try:
+            async with create_client_server_memory_streams() as ((cr, cw), (sr, sw)):
+                async with anyio.create_task_group() as tg:
+                    async def serve() -> None:
+                        low = s.mcp._lowlevel_server
+                        await low.run(sr, sw, low.create_initialization_options())
+
+                    tg.start_soon(serve)
+                    async with ClientSession(cr, cw, **client_kw) as cs:
+                        await cs.initialize()
+                        result = await cs.call_tool(tool, args)
+                    tg.cancel_scope.cancel()
+            return result.content[0].text
+        finally:
+            s.COUNCIL = saved
+
+    supports = {"sampling_callback": as_subagent,
+                "sampling_capabilities": types.SamplingCapability()}
+
+    peer = cfg.Member(id="peer", model="m", base_url="https://h/v1", api_key="k",
+                      label="Peer", retries=0)
+
+    # Two rounds, mixed table: the sampled seat and an HTTP one, side by side.
+    # The peer has to really answer, or ask_all is right to refuse round 2.
+    with serving(_ok):
+        out = await call("ask_all", {"prompt": "Why is the sky blue?", "rounds": 2},
+                         {"sub": sub, "peer": peer}, **supports)
+    assert len(asked) == 2, f"the client was asked {len(asked)} times, wanted 2"
+    assert "Why is the sky blue?" in asked[0]
+    assert "Subagent answer 1" in asked[1], "round 2 did not carry the subagent's own answer"
+    assert "Subagent answer 2" in out and "ROUND 2 of 2" in out, out
+    assert "(this client)" in out, "the transcript hid that this seat was the caller"
+    assert "not a second opinion" in out, "no warning that this is not independent evidence"
+    # The unreachable HTTP peer degrades on its own and does not take the seat down.
+    assert "Peer" in out, out
+
+    # A client that never offered sampling: say so, and keep the rest of the council.
+    asked.clear()
+    with serving(_ok):
+        plain = await call("ask_all", {"prompt": "hi"}, {"sub": sub, "peer": peer})
+    assert not asked, "the client answered despite offering no sampling capability"
+    assert "did not offer the sampling capability" in plain, plain
+    assert "pong" in plain, "one dead seat took the whole council with it"
+    assert "not a second opinion" not in plain, \
+        "claimed an answer came from us when the seat only ever errored"
+
+    # probe_models has nothing to probe for a seat with no endpoint.
+    asked.clear()
+    probed = await call("probe_models", {}, {"sub": sub}, **supports)
+    assert "no endpoint to probe" in probed, probed
+
+    # `ask` on its own carries the same caveat. Called directly rather than over
+    # the wire: `model` is a schema enum frozen at import from the real roster,
+    # so a test-only id cannot be passed through a live client.
+    class Session:
+        client_capabilities = types.ClientCapabilities(sampling=types.SamplingCapability())
+
+        async def create_message(self, **kw):
+            return types.CreateMessageResult(
+                role="assistant", model="client-side-model",
+                content=types.TextContent(type="text", text="a lone answer"))
+
+    saved = s.COUNCIL
+    s.COUNCIL = cfg.Council({"sub": sub}, "test")
+    try:
+        one = await s.ask("sub", "hi", ctx=type("C", (), {"session": Session()})())
+    finally:
+        s.COUNCIL = saved
+    assert "a lone answer" in one and "not a second opinion" in one, one
+
+    print("ok  sampling seat (client answers, degrades cleanly, never claims independence)")
+
+
+async def test_sampling_without_a_back_channel() -> None:
+    """Stateless HTTP has no way back to the client, and no retry invents one."""
+    from model_council.providers import ask_member
+    from mcp.shared.exceptions import NoBackChannelError
+
+    class Deaf:
+        client_capabilities = None
+
+        async def create_message(self, **kw):
+            raise NoBackChannelError("no back-channel")
+
+    m = cfg.Member(id="sub", format="sampling", label="Subagent", retry_backoff=0)
+    a = await ask_member(m, "hi", session=Deaf())
+    assert not a.ok and a.attempts == 1, (a.text, a.attempts)
+    assert "no way back" in a.text and "stateless" in a.text.lower(), a.text
+
+    # No session at all — a direct Python call rather than a live tool call.
+    b = await ask_member(m, "hi")
+    assert not b.ok and "live tool call" in b.text, b.text
+    print("ok  sampling without a back-channel (reported once, never retried)")
 
 
 # --------------------------------------------------------------------------- #
@@ -420,12 +547,12 @@ async def test_rounds_carry_the_previous_answers() -> None:
     beta = cfg.Member(id="b", model="m-b", base_url="https://h/v1", api_key="k", label="Beta")
     seen: list[tuple[str, str]] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, session=None):
         seen.append((m.id, prompt))
         n = sum(1 for i, _ in seen if i == m.id)
         return Answer(m, f"{m.label} says {n}", ok=True)
 
-    async def only_alpha_answers(m, prompt, system=None):
+    async def only_alpha_answers(m, prompt, system=None, session=None):
         seen.append((m.id, prompt))
         return Answer(m, f"{m.label} answer", ok=(m.id == "a"))
 
@@ -723,6 +850,8 @@ def main() -> None:
     asyncio.run(test_retry_transport())
     asyncio.run(test_rounds_carry_the_previous_answers())
     asyncio.run(test_weights_reach_the_reader_not_the_members())
+    asyncio.run(test_sampling_seat())
+    asyncio.run(test_sampling_without_a_back_channel())
     asyncio.run(test_tools())
 
 

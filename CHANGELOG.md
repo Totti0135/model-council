@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0
+
+**A seat your own model can take.** A member with `format: "sampling"` has no
+endpoint and no key: the server sends `sampling/createMessage` back down the open
+MCP session and the client answers with its own model. It joins rounds like any
+other member, costs no quota, and needs one line of config:
+
+```json
+{ "id": "sub", "format": "sampling", "label": "Subagent" }
+```
+
+Its answers are labelled `(this client)` rather than with a model id, and any
+transcript containing one ends with a note saying what it is: a fresh instance
+carrying none of the conversation, but the same model that is reading the
+transcript and writing the conclusion. A second look, not a second opinion —
+counting its agreement as corroboration is the one mistake the seat makes easy,
+and the note exists to spend a sentence preventing it. A seat that only ever
+errored draws no such note, because then there is no answer of ours to caveat.
+
+Two things it cannot do, both said plainly rather than discovered: a client that
+never offered the sampling capability gets a message explaining exactly that
+while the rest of the council answers normally, and the seat cannot work over
+`--http` at all — sampling is a request travelling back to the client and this
+server is stateless, so it warns at startup instead of failing per call.
+
+**This rides a deprecation window on purpose.** MCP deprecated Sampling in the
+`2026-07-28` spec (SEP-2577) with a minimum twelve-month window, suggesting new
+work "integrate directly with LLM provider APIs instead" — which is what every
+other member here already does. It is kept because it is the only way to seat the
+client's own model without a second key, and because the replacement pattern
+(MRTR) resolves its request once before the tool body runs, which a multi-round
+council cannot express. If Sampling is removed, this seat stops working and
+nothing else does.
+
 ## 0.5.0
 
 **`--http` serves a team from one deployment.** Until now the server only spoke

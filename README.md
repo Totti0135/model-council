@@ -42,7 +42,8 @@ prompt than the last, so 1 is right for a survey of opinion and 2 for a question
 where the disagreement is the interesting part.
 
 Members can also carry different [weights](#weights), for the common case where
-the council is not a council of equals.
+the council is not a council of equals, and one seat can be
+[your own client's model](#a-seat-for-your-own-model) rather than an endpoint.
 
 ### Retries
 
@@ -302,7 +303,7 @@ The first three travel together as one unit — see the rule above.
 |-------|-----------|-------|
 | `base_url` | provider, or a member with no provider | Root the route hangs off — `/chat/completions` for openai, `/v1/messages` for anthropic. Usually ends in `/v1` for OpenAI-compatible hosts |
 | `api_key` | provider, or a member with no provider | |
-| `format` | provider, or a member with no provider | `openai` (default) or `anthropic` |
+| `format` | provider, or a member with no provider | `openai` (default), `anthropic`, or `sampling` — see [A seat for your own model](#a-seat-for-your-own-model) |
 | `model` | member | The model id sent to the endpoint |
 | `label` | member | Display name in answers; defaults to the id |
 | `weight` | member | How far this member's opinion carries. Default 1, max 10, `0` for advisory only. See [Weights](#weights) |
@@ -354,6 +355,53 @@ answers and not their standing. The weights are for whoever reads the transcript
 and they are a prior, not a vote: they break ties and decide who carries the
 burden of proof. A specific, checkable reason from the lowest weight still beats
 a bare assertion from the highest.
+
+### A seat for your own model
+
+A member with `format: "sampling"` has no endpoint and no key. It is answered by
+the MCP client itself: the server sends a `sampling/createMessage` request back
+down the open session, and the client runs the prompt on its own model.
+
+```json
+{ "id": "sub", "format": "sampling", "label": "Subagent" }
+```
+
+That is the whole configuration — `base_url`, `api_key` and `model` are all
+optional, and `model` is only a hint the client may ignore. The seat costs no
+key and no quota, and it takes part in rounds like any other member.
+
+**It is not an outside opinion.** The answer comes from a fresh instance carrying
+none of your conversation, which makes it a real second look — but it is the same
+model that is reading the transcript and writing the conclusion. `ask_all` says so
+under any answer it produces:
+
+```
+===== Subagent (this client) =====
+...
+
+[Subagent was answered by your own model, over a sampling request back to you: a
+fresh instance carrying none of this conversation, but the same model reasoning
+again. Read it as a second look, not a second opinion — ...]
+```
+
+Two limits worth knowing before you seat one:
+
+- **Most clients do not support sampling.** It is optional, and a client that
+  never offered the capability gets told exactly that, while the rest of the
+  council answers normally.
+- **It cannot work over `--http`.** Sampling is a request travelling back to the
+  client, and this server runs stateless HTTP, which has no channel for one. The
+  server warns about it at startup. Seat these on stdio.
+
+> **On the deprecation.** MCP deprecated Sampling in the `2026-07-28` spec
+> ([SEP-2577](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577)),
+> with a minimum twelve-month window before removal, and suggests new work
+> "integrate directly with LLM provider APIs instead" — which is what every other
+> member here already does. This seat rides that window on purpose: it is the only
+> way to seat the client's own model without a second key, and the replacement
+> pattern (MRTR) resolves a request once before the tool body runs, which a
+> multi-round council cannot express. If it is removed, the seat stops working
+> and nothing else does.
 
 ### Wire format notes
 

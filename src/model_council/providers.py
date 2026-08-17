@@ -4,6 +4,10 @@ Two shapes cover nearly every endpoint worth talking to: the OpenAI Chat
 Completions format (`POST {base_url}/chat/completions`) and the Anthropic
 Messages format (`POST {base_url}/v1/messages`).
 
+A third, `sampling`, sends nothing outward: it asks the MCP client to run the
+prompt on its own model and hand the text back. The seat costs no key and no
+quota, but it is only as available as the client's support for it.
+
 A call that fails for a transient reason is retried; one that fails for a
 permanent reason is not. What survives that is returned as readable text rather
 than raised, so one unreachable member degrades the answer instead of killing
@@ -14,13 +18,17 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import httpx
 
-from model_council.config import Member
+from mcp.shared.exceptions import MCPDeprecationWarning, MCPError, NoBackChannelError
+from mcp_types import ModelHint, ModelPreferences, SamplingMessage, TextContent
+
+from model_council.config import SAMPLING, Member
 
 _PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY")
 
@@ -113,6 +121,65 @@ async def _call_openai(m: Member, prompt: str, system: str | None) -> str:
     return content
 
 
+class SamplingUnavailable(Exception):
+    """This seat cannot be reached: no live session, or a client that does not sample.
+
+    Local conditions, both of them — which is why this is not an `MCPError`.
+    Nothing arrived over the connection to complain about; we never sent anything.
+    """
+
+
+async def _call_sampling(m: Member, prompt: str, system: str | None, session) -> str:
+    """Ask the MCP client to run this prompt on its own model.
+
+    The request travels back down the connection the client already opened, so
+    there is no endpoint and no credential — the client holds both, picks the
+    model, and pays for it. `model` is passed only as a hint, which the client
+    is free to ignore; choosing the model belongs to whoever is billed for it.
+
+    Two failures are worth telling apart, because the remedies are opposite: a
+    client that never offered sampling (nothing to do but use a different seat)
+    and a connection with no way back (the server's own doing — see the note in
+    server.py about stateless HTTP).
+    """
+    if session is None:
+        raise SamplingUnavailable(
+            "this seat is answered by the MCP client's own model, so it only works "
+            "inside a live tool call from that client")
+
+    caps = getattr(session, "client_capabilities", None)
+    if caps is not None and getattr(caps, "sampling", None) is None:
+        raise SamplingUnavailable(
+            f"the connected MCP client did not offer the sampling capability, so it "
+            f"cannot answer as '{m.id}'. Sampling is optional and many clients omit "
+            f"it; give this seat a real endpoint instead, or disable it")
+
+    # SEP-2577 deprecated the sampling capability in favour of resolver-shaped
+    # requests, and the SDK warns on every call. The replacement cannot express
+    # this: a resolver runs once before the tool body and must render the same
+    # request on every retry round, while a council samples repeatedly, with a
+    # different prompt each round, interleaved with parallel HTTP calls. So the
+    # warning is not something a caller can act on — it is silenced here, once,
+    # rather than printed into the client's log on every answer.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MCPDeprecationWarning)
+        result = await session.create_message(
+            messages=[SamplingMessage(role="user",
+                                      content=TextContent(type="text", text=prompt))],
+            max_tokens=m.max_tokens,
+            system_prompt=system,
+            temperature=m.temperature,
+            model_preferences=(ModelPreferences(hints=[ModelHint(name=m.model)])
+                               if m.model else None),
+        )
+
+    content = getattr(result, "content", None)
+    text = getattr(content, "text", "") if getattr(content, "type", "") == "text" else ""
+    if not text:
+        raise BadPayload(f"the client returned no text: {str(content)[:400]}")
+    return text
+
+
 async def _call_anthropic(m: Member, prompt: str, system: str | None) -> str:
     # max_tokens is required by this format, which is why it only applies here.
     payload: dict = {
@@ -177,14 +244,23 @@ def _backoff(attempt: int, base: float) -> float:
     return window / 2 + random.uniform(0, window / 2)
 
 
-async def ask_member(m: Member, prompt: str, system: str | None = None) -> Answer:
-    """Send one prompt to one member, retrying transient failures, never raising."""
+async def ask_member(m: Member, prompt: str, system: str | None = None,
+                     *, session=None) -> Answer:
+    """Send one prompt to one member, retrying transient failures, never raising.
+
+    `session` is the live MCP session, needed only by sampling members; the HTTP
+    formats ignore it.
+    """
     if not m.configured:
         return Answer(m, f"[{m.label} is not configured — missing {', '.join(m.missing)}. "
                          f"See the server's README for how to configure a council member.]",
                       ok=False, attempts=0)
 
-    call = _call_anthropic if m.format == "anthropic" else _call_openai
+    if m.is_sampling:
+        async def call(mem, p, sys_):
+            return await _call_sampling(mem, p, sys_, session)
+    else:
+        call = _call_anthropic if m.format == "anthropic" else _call_openai
     attempts = m.retries + 1
     attempt = 0
     detail = ""
@@ -210,6 +286,18 @@ async def ask_member(m: Member, prompt: str, system: str | None = None) -> Answe
             # reproduce it, and pay for it again.
             detail = str(e)
             break
+        except NoBackChannelError:
+            # Nothing can travel back to the client on this connection, and no
+            # amount of waiting changes that.
+            detail = ("this seat is answered by the MCP client, but this connection has "
+                      "no way back to it. Stateless HTTP is the usual cause: sampling "
+                      "needs a session, so seat this member on a stdio server instead")
+            break
+        except (MCPError, SamplingUnavailable) as e:
+            # The client refused, or has nothing to refuse with. Retrying would
+            # only re-prompt a client that already said no.
+            detail = str(e)
+            break
         except Exception as e:  # noqa: BLE001 - surface any failure back to the caller
             detail = f"error: {type(e).__name__}: {e}"
             break
@@ -226,6 +314,9 @@ async def probe_member(m: Member) -> str:
     Deliberately single-shot: this is a diagnostic, and a diagnostic that
     retries just delays the diagnosis.
     """
+    if m.is_sampling:
+        return ("[no endpoint to probe — this seat is answered by the MCP client's "
+                "own model, and the client chooses which one]")
     if m.format == "anthropic":
         url = m.base_url + "/v1/models"
         headers = {"x-api-key": m.api_key, "anthropic-version": "2023-06-01", **m.headers}

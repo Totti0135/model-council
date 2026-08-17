@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1
+
+**0.4.0 told clients it was 0.3.0.** The version lives in four files and the
+0.4.0 release bumped three of them: `__init__.__version__` was left behind, and
+that is the one passed to `MCPServer(...)`, so the package announced the wrong
+version in the MCP handshake. Cosmetic — every tool in 0.4.0 behaves as
+documented — but not fixable in place, since PyPI does not allow a version to be
+re-uploaded.
+
+The smoke test now checks `__init__` against `pyproject.toml` alongside
+`server.json` and `manifest.json`. It already cross-checked the other three,
+which is exactly why this was the one that drifted.
+
 ## 0.4.0
 
 **`ask_all` can run the discussion itself: `rounds=2`.** Round 1 is the usual

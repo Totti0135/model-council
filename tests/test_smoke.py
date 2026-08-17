@@ -383,12 +383,21 @@ async def test_rounds_carry_the_previous_answers() -> None:
 
 
 def test_registry_metadata_agrees() -> None:
-    """server.json must name the same server the README claims ownership of.
+    """server.json must name the same server the README claims ownership of,
+    and every file that records a version must record the same one.
 
     The registry verifies ownership by finding `mcp-name: <name>` in the README
     that PyPI shows; if the two ever disagree, publishing fails after the PyPI
     upload has already happened, which is the worst moment to find out.
+
+    The version lives in four places, and __init__ is the one that is easy to
+    forget because nothing downstream reads it back: it is what the server
+    advertises in the MCP handshake, so a stale value ships a package that
+    misreports itself to every client, and PyPI will not take the version
+    number back to fix it.
     """
+    import model_council
+
     root = Path(__file__).resolve().parent.parent
     server_json = root / "server.json"
     if not server_json.exists():
@@ -403,6 +412,10 @@ def test_registry_metadata_agrees() -> None:
     manifest = root / "manifest.json"
     if manifest.exists():   # the desktop-extension bundle ships the same version
         assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == version
+
+    assert model_council.__version__ == version, (
+        f"__init__ says {model_council.__version__}, pyproject says {version} — the "
+        f"server would advertise the wrong version to every client")
 
     assert f"mcp-name: {doc['name']}" in readme, "README is missing the ownership marker"
     assert doc["version"] == version, (doc["version"], version)

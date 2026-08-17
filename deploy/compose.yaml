@@ -1,0 +1,30 @@
+# docker compose -f deploy/compose.yaml up -d
+#
+# Put the real values in deploy/.env (which .gitignore already covers) or in the
+# environment, and keep the provider keys out of this file.
+
+services:
+  model-council:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: model-council:local
+    restart: unless-stopped
+    ports:
+      # Bind the host side to one interface rather than every one: the
+      # allowlist decides who may call, but there is no reason to publish the
+      # port anywhere it is not wanted in the first place.
+      - "${BIND_ADDR:-0.0.0.0}:8000:8000"
+    environment:
+      COUNCIL_CONFIG: /config/config.json
+      # Required — the server refuses to serve a network it was not told about.
+      # CIDRs, addresses, or the name `private` for all of RFC1918.
+      COUNCIL_ALLOW: ${COUNCIL_ALLOW:?set COUNCIL_ALLOW to the networks that may call}
+      # Set only when a reverse proxy sits in front, to the proxy's own address.
+      # Without it X-Forwarded-For is ignored and every caller looks like the proxy.
+      COUNCIL_TRUST_PROXY: ${COUNCIL_TRUST_PROXY:-}
+    volumes:
+      - ${COUNCIL_CONFIG_FILE:-/etc/model-council/config.json}:/config/config.json:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

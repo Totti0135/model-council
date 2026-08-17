@@ -34,7 +34,8 @@ def env(**overrides: str):
     saved_default = cfg.DEFAULT_CONFIG_PATH
     for k in list(os.environ):
         if k.startswith("COUNCIL_") or k.endswith(
-            ("_BASE_URL", "_API_KEY", "_MODEL", "_FORMAT", "_HEADERS", "_ENABLED")
+            ("_BASE_URL", "_API_KEY", "_MODEL", "_FORMAT", "_HEADERS", "_ENABLED",
+             "_WEIGHT")
         ):
             del os.environ[k]
     os.environ["COUNCIL_ENV_FILE"] = "/nonexistent"
@@ -239,6 +240,86 @@ def test_retry_settings() -> None:
     with env():
         assert cfg.load_council().members["glm"].retries == 2   # built-in default
     print("ok  retry settings (provider inheritance, per-member override, clamp)")
+
+
+def test_weights() -> None:
+    """Weights are per member, default to 1, and cannot be set to nonsense."""
+    doc = {
+        "providers": {"relay": {"base_url": "https://r/v1", "api_key": "k",
+                                "weight": 5}},
+        "members": [
+            {"id": "strong", "provider": "relay", "model": "m", "weight": 2.5},
+            {"id": "plain", "provider": "relay", "model": "m"},
+            {"id": "advisory", "provider": "relay", "model": "m", "weight": 0},
+            {"id": "greedy", "provider": "relay", "model": "m", "weight": 1e9},
+            {"id": "negative", "provider": "relay", "model": "m", "weight": -3},
+            {"id": "typo", "provider": "relay", "model": "m", "weight": "high"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    assert c.members["strong"].weight == 2.5
+    assert c.members["plain"].weight == 1.0            # not inherited from the provider
+    assert any("weight" in w for w in c.warnings), c.warnings   # it is not a provider field
+    assert c.members["advisory"].weight == 0.0         # answers, but counts for nothing
+    assert c.members["greedy"].weight == cfg._MAX_WEIGHT
+    assert c.members["negative"].weight == 0.0         # a weight below zero is meaningless
+    assert c.members["typo"].weight == 1.0             # neutral, and visible in list_council
+
+    with env(COUNCIL_MODELS="a,b,c", A_WEIGHT="3", B_WEIGHT=""):
+        e = cfg.load_council()
+    assert (e.members["a"].weight, e.members["b"].weight, e.members["c"].weight) == (3, 1, 1)
+    print("ok  weights (per member, default 1, clamped, typos fall back to neutral)")
+
+
+async def test_weights_reach_the_reader_not_the_members() -> None:
+    """A weight is reported with the answers and withheld from the models.
+
+    Both halves matter. The caller cannot weigh opinions it cannot see, and a
+    member told it is outranked stops arguing — which would cost exactly the
+    dissent the second round exists to surface.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str, **kw) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=mid.title(), **kw)
+
+    alpha, beta = member("alpha", weight=3), member("beta", weight=0.5)
+    prompts: list[str] = []
+
+    async def answering(m, prompt, system=None):
+        prompts.append(prompt)
+        return Answer(m, f"{m.label} says so", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"alpha": alpha, "beta": beta}, "test")
+        out = await s.ask_all("Why is the sky blue?", rounds=2)
+        assert "weight 3" in out and "weight 0.5" in out, out
+        assert "[WEIGHTS — Alpha 3, Beta 0.5]" in out, out          # ranked, highest first
+        assert "not votes" in out, "the caller was given a ranking and no way to read it"
+        assert "Weight 0 is advisory" not in out, "nobody here has weight 0"
+        assert not any("weight" in p.lower() for p in prompts), \
+            "a member was told how the council ranks it"
+
+        # Equal weights say nothing, so they are not mentioned at all.
+        s.COUNCIL = cfg.Council({"alpha": member("alpha"), "beta": member("beta")}, "test")
+        plain = await s.ask_all("Why is the sky blue?")
+        assert "weight" not in plain.lower(), plain
+
+        s.COUNCIL = cfg.Council({"alpha": alpha, "beta": member("beta", weight=0)}, "test")
+        zeroed = await s.ask_all("Why is the sky blue?")
+        assert "Weight 0 is advisory" in zeroed, zeroed
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  weights (labeled for the caller, never shown to the members)")
 
 
 # --------------------------------------------------------------------------- #
@@ -520,6 +601,110 @@ async def test_tools() -> None:
         print("\n(no live keys configured — skipped the network round-trip)")
 
 
+def test_allowlist_parsing() -> None:
+    from model_council.access import parse_networks
+
+    assert [str(n) for n in parse_networks("loopback")] == ["127.0.0.0/8", "::1/128"]
+    assert str(parse_networks("private")[0]) == "10.0.0.0/8"
+    # Commas, whitespace and a mix of forms all arrive from different config
+    # files, and must land in the same place.
+    got = [str(n) for n in parse_networks(" 10.20.0.0/16,  10.30.1.5 ")]
+    assert got == ["10.20.0.0/16", "10.30.1.5/32"], got
+    assert parse_networks("") == []
+    for bad in ("nonsense", "10.0.0.0/99", "10.0.0.300"):
+        try:
+            parse_networks(bad)
+        except ValueError as e:
+            assert "private" in str(e), e          # the message lists what is valid
+        else:
+            raise AssertionError(f"{bad!r} should not have parsed")
+    print("ok  allowlist parsing (CIDRs, bare addresses, aliases, refusals)")
+
+
+async def _gate_status(gate, peer: str | None, headers: dict | None = None) -> int:
+    """Push one request through a ClientGate and report the status it produced."""
+    scope = {
+        "type": "http", "method": "GET", "path": "/healthz",
+        "client": (peer, 51000) if peer else None,
+        "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
+    }
+    seen: list[int] = []
+
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            seen.append(msg["status"])
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    await gate(scope, receive, send)
+    return seen[0]
+
+
+async def test_http_gate() -> None:
+    from model_council.access import ClientGate, parse_networks
+
+    async def ok_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    allow = parse_networks("10.0.0.0/8")
+
+    plain = ClientGate(ok_app, allow=allow)
+    assert await _gate_status(plain, "10.1.2.3") == 200
+    assert await _gate_status(plain, "8.8.8.8") == 403
+    assert await _gate_status(plain, "127.0.0.1") == 200      # loopback is implicit
+    assert await _gate_status(plain, "::ffff:10.1.2.3") == 200  # dual-stack peer form
+    assert await _gate_status(plain, None) == 403             # no peer, no admission
+
+    # Without --trust-proxy the header is not evidence of anything, so an
+    # outsider cannot write themselves an address on the allowlist.
+    assert await _gate_status(plain, "8.8.8.8", {"X-Forwarded-For": "10.1.2.3"}) == 403
+
+    behind = ClientGate(ok_app, allow=allow, trusted_proxies=parse_networks("192.0.2.9"))
+    assert await _gate_status(behind, "192.0.2.9", {"X-Forwarded-For": "10.1.2.3"}) == 200
+    assert await _gate_status(behind, "192.0.2.9", {"X-Forwarded-For": "8.8.8.8"}) == 403
+    # The rightmost untrusted hop is the client: prepending something allowed to
+    # the chain is exactly the spoof this rule exists to defeat.
+    assert await _gate_status(
+        behind, "192.0.2.9", {"X-Forwarded-For": "10.1.2.3, 8.8.8.8"}) == 403
+    assert await _gate_status(
+        behind, "192.0.2.9", {"X-Forwarded-For": "8.8.8.8, 10.1.2.3"}) == 200
+
+    # A browser inside the allowlist is still inside the allowlist, so Origin —
+    # which MCP clients do not send and pages always do — is what stops it.
+    assert await _gate_status(plain, "10.1.2.3", {"Origin": "https://evil.example"}) == 403
+    lax = ClientGate(ok_app, allow=allow, allowed_origins=["https://tools.corp"])
+    assert await _gate_status(lax, "10.1.2.3", {"Origin": "https://tools.corp"}) == 200
+    assert await _gate_status(lax, "10.1.2.3", {"Origin": "https://evil.example"}) == 403
+
+    print("ok  http gate (allowlist, forwarded-for trust, origin refusal)")
+
+
+def test_http_refuses_to_serve_the_world() -> None:
+    """Binding a network without saying who may reach it must not start.
+
+    The allowlist is the only thing standing between shared provider keys and
+    whoever finds the port, so it cannot be something you forget.
+    """
+    from model_council import server as s
+
+    for argv in (["--http", "--host", "0.0.0.0"],
+                 ["--http", "--host", "192.168.1.10"],
+                 ["--http", "--allow", "bogus"]):
+        try:
+            s.main(argv)
+        except SystemExit as e:
+            assert e.code != 0, argv
+        else:
+            raise AssertionError(f"{argv} should have refused to start")
+
+    # Loopback needs no flag: the bind address is already the limit.
+    parser, args = s._parse_args(["--http"])
+    assert args.host == "127.0.0.1" and args.allow == ""
+    print("ok  http refuses a network bind with no allowlist")
+
+
 def main() -> None:
     test_default_roster()
     test_env_roster()
@@ -527,12 +712,17 @@ def main() -> None:
     test_connection_is_atomic()
     test_proxy_policy()
     test_retry_settings()
+    test_weights()
     test_registry_metadata_agrees()
     test_explicit_beats_discovered()
     test_shipped_example_is_valid()
     test_missing_file_falls_back()
+    test_allowlist_parsing()
+    test_http_refuses_to_serve_the_world()
+    asyncio.run(test_http_gate())
     asyncio.run(test_retry_transport())
     asyncio.run(test_rounds_carry_the_previous_answers())
+    asyncio.run(test_weights_reach_the_reader_not_the_members())
     asyncio.run(test_tools())
 
 

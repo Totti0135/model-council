@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "model-council",
   "display_name": "Model Council",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Consult other LLMs as tools — ask them, compare their answers, synthesize a conclusion.",
   "long_description": "Seats other LLMs at your table as tools, so your assistant can ask them, relay their answers back and forth for critique, and give you one merged conclusion — inside a single conversation, with no copy-paste.\n\nThe form below configures two seats, which is the smallest council worth having. Each takes an endpoint, a key, a model id, and which wire format that endpoint speaks: `openai` for anything OpenAI-compatible, `anthropic` for the Messages format. Setting the URL of an Anthropic-style endpoint without also setting the format is the one mistake that reliably breaks a seat.\n\nFor more than two members, or for several models sharing one endpoint and one key, point \"Config file\" at a JSON config instead; it takes precedence over the fields above. The project README documents its shape.",
   "author": {
@@ -34,11 +34,13 @@
         "FIRST_API_KEY": "${user_config.first_api_key}",
         "FIRST_MODEL": "${user_config.first_model}",
         "FIRST_FORMAT": "${user_config.first_format}",
+        "FIRST_WEIGHT": "${user_config.first_weight}",
 
         "SECOND_BASE_URL": "${user_config.second_base_url}",
         "SECOND_API_KEY": "${user_config.second_api_key}",
         "SECOND_MODEL": "${user_config.second_model}",
-        "SECOND_FORMAT": "${user_config.second_format}"
+        "SECOND_FORMAT": "${user_config.second_format}",
+        "SECOND_WEIGHT": "${user_config.second_weight}"
       }
     }
   },
@@ -70,6 +72,13 @@
       "default": "openai",
       "required": false
     },
+    "first_weight": {
+      "type": "number",
+      "title": "First model — weight",
+      "description": "How far this model's opinion carries against the other seat. Leave both at 1 for equals; raise this to 2 if you trust it twice as far. Reported with the answers, never shown to the models.",
+      "default": 1,
+      "required": false
+    },
 
     "second_base_url": {
       "type": "string",
@@ -95,6 +104,13 @@
       "title": "Second model — wire format",
       "description": "openai or anthropic.",
       "default": "openai",
+      "required": false
+    },
+    "second_weight": {
+      "type": "number",
+      "title": "Second model — weight",
+      "description": "Only the ratio between the two matters, so 2 and 1 is the same council as 10 and 5. Use 0 for a seat you want to hear from but not count.",
+      "default": 1,
       "required": false
     },
 

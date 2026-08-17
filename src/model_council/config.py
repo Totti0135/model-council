@@ -42,12 +42,18 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _PROVIDER_FIELDS = {"base_url", "api_key", "format", "headers", "timeout", "proxy",
                     "retries", "retry_backoff"}
 _MEMBER_FIELDS = _PROVIDER_FIELDS | {
-    "id", "model", "label", "max_tokens", "temperature", "enabled",
+    "id", "model", "label", "max_tokens", "temperature", "enabled", "weight",
 }
 
 # A ceiling on retries, because the cost of a typo here is paid in real requests
 # to a real provider: `"retries": 50` should not turn one question into fifty.
 _MAX_RETRIES = 5
+
+# Weight is deliberately not a provider field: two members on one relay can be a
+# frontier model and a small fast one, so it belongs to the seat, not the
+# endpoint. Only ratios mean anything, and the ceiling keeps one member from
+# being given a number so large that every other answer rounds to noise.
+_MAX_WEIGHT = 10.0
 
 # Who you talk to, and how you prove who you are. These three travel together:
 # a member that names a provider may not override any of them, because taking
@@ -82,6 +88,24 @@ def load_dotenv(path: Path | None = None) -> None:
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
+def _clamp_weight(value) -> float:
+    """Read a weight, refusing the values that would break the comparison.
+
+    A negative weight, a NaN, or a word where a number belongs is not a weaker
+    opinion — it is a typo, and one that would silently corrupt every ranking
+    the weights are read for. Falling back to the neutral 1 keeps the member in
+    the discussion on equal footing, and `list_council` prints the effective
+    value, so the typo is one command away from being visible.
+    """
+    try:
+        w = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if w != w:                      # NaN: every comparison against it is false
+        return 1.0
+    return max(0.0, min(w, _MAX_WEIGHT))
+
+
 @dataclass
 class Member:
     """One seat on the council."""
@@ -94,6 +118,10 @@ class Member:
     label: str = ""
     max_tokens: int = 8192
     temperature: float | None = None
+    # How much this council trusts this member relative to the others. It
+    # changes nothing about the call: it travels with the answer so that
+    # whoever reads a disagreement knows which side the roster rates higher.
+    weight: float = 1.0
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float = 180.0
     # Extra attempts a transient failure gets — a 429, a 5xx, a dropped
@@ -113,6 +141,7 @@ class Member:
         self.format = (self.format or "openai").lower()
         self.retries = max(0, min(int(self.retries), _MAX_RETRIES))
         self.retry_backoff = max(0.0, float(self.retry_backoff))
+        self.weight = _clamp_weight(self.weight)
 
     @property
     def configured(self) -> bool:
@@ -205,6 +234,7 @@ def _member_from_env(member_id: str, defaults: dict, fallback: dict) -> Member:
         label=os.environ.get(f"{p}_LABEL", defaults.get("label", "")),
         max_tokens=int(os.environ.get(f"{p}_MAX_TOKENS", "8192")),
         temperature=float(temp) if temp else None,
+        weight=_clamp_weight(os.environ.get(f"{p}_WEIGHT", "1")),
         headers=_env_json(f"{p}_HEADERS"),
         timeout=float(os.environ.get(f"{p}_TIMEOUT", str(fallback["timeout"]))),
         retries=int(os.environ.get(f"{p}_RETRIES", str(fallback["retries"]))),

@@ -1,0 +1,52 @@
+# /etc/systemd/system/model-council.service
+#
+#   sudo useradd --system --no-create-home council
+#   sudo python3 -m venv /opt/model-council
+#   sudo /opt/model-council/bin/pip install model-council-mcp
+#   sudo install -d -m 750 -o root -g council /etc/model-council
+#   sudo install -m 640 -o root -g council config.json /etc/model-council/config.json
+#   sudo systemctl enable --now model-council
+#
+# The config file holds the provider keys, so it is readable by the service and
+# by root, and by nobody else.
+
+[Unit]
+Description=Model Council MCP server
+Documentation=https://github.com/Totti0135/model-council
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=council
+Group=council
+Environment=COUNCIL_CONFIG=/etc/model-council/config.json
+
+# --allow is what stands between shared provider keys and whoever finds the
+# port; narrow it to the networks that actually need to call. `private` means
+# all of RFC1918. Add --trust-proxy <address> only if a reverse proxy sits in
+# front, otherwise every caller will look like that proxy.
+ExecStart=/opt/model-council/bin/model-council-mcp --http --host 0.0.0.0 --allow private
+
+Restart=on-failure
+RestartSec=5s
+
+# The process reads one config file, speaks to provider APIs over the network,
+# and has no business doing anything else on this machine.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

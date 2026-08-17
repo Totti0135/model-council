@@ -19,7 +19,7 @@ self-run gateway, a local server, or several of each.
 |------|--------------|
 | `ask(model, prompt)` | Ask one member by id |
 | `ask_all(prompt, models?, rounds?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion |
-| `list_council()` | The roster: ids, endpoints, call budget, and whether each member is ready. No network calls |
+| `list_council()` | The roster: ids, endpoints, weights, call budget, and whether each member is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
 Members are stateless and cannot see your conversation, so the chair passes
@@ -40,6 +40,9 @@ nothing between calls, so without it a second round is just the same question
 asked twice. Up to 3 rounds; each one costs another call per member and a longer
 prompt than the last, so 1 is right for a survey of opinion and 2 for a question
 where the disagreement is the interesting part.
+
+Members can also carry different [weights](#weights), for the common case where
+the council is not a council of equals.
 
 ### Retries
 
@@ -114,6 +117,98 @@ claude mcp add model-council -e GPT5_BASE_URL=... -e GPT5_API_KEY=... -- uvx mod
 Anything that launches a stdio server works: run `uvx model-council-mcp` and
 pass the same environment variables.
 
+## Serving a team over HTTP
+
+Everything above runs one copy of the server per person, launched by their own
+MCP client, configured with their own keys. `--http` is the other shape: one
+deployment holds one set of keys and answers a whole team, who configure a URL
+and no secret at all.
+
+```bash
+model-council-mcp --http --host 0.0.0.0 --allow 10.20.0.0/16
+```
+
+Colleagues then add it as a remote server, with nothing sensitive in the config:
+
+```bash
+claude mcp add --transport http model-council http://council.internal:8000/mcp
+```
+
+```jsonc
+// Claude Desktop and other clients
+{ "mcpServers": { "model-council": { "type": "http", "url": "http://council.internal:8000/mcp" } } }
+```
+
+`deploy/` has a [Dockerfile](deploy/Dockerfile), a
+[compose file](deploy/compose.yaml) and a [systemd unit](deploy/model-council.service).
+
+### Who may call
+
+Over stdio the operating system answers this: whoever launched the process
+already had the keys. HTTP removes that guarantee — one port now stands in front
+of shared provider quota — so the server **refuses to start** on a non-loopback
+address until `--allow` says who may reach it. Loopback needs no flag, and is
+always admitted.
+
+| Flag | |
+|------|---|
+| `--allow` | CIDRs, bare addresses, or the names `private` (RFC1918), `loopback`, `any` |
+| `--trust-proxy` | reverse proxies whose `X-Forwarded-For` may be believed |
+| `--allow-origin` | permit a browser `Origin`; repeatable |
+
+`--trust-proxy` is the one worth reading twice. Without it `X-Forwarded-For` is
+ignored entirely and the peer address decides — behind nginx that is nginx, so
+the allowlist matches everyone or no one. With it, the client is the rightmost
+hop in the chain that is *not* a trusted proxy, which is what stops a caller
+from writing `X-Forwarded-For: 10.0.0.1` and walking straight through.
+
+Requests carrying an `Origin` header are refused by default. MCP clients are not
+browsers and do not send one; a web page always does. An allowlist admits every
+machine on the office network, and each of those runs a browser that will issue
+requests on behalf of whatever page it has open — `Origin` is what tells the two
+apart.
+
+Every flag has an environment variable (`COUNCIL_ALLOW`, `COUNCIL_TRUST_PROXY`,
+`COUNCIL_HTTP_HOST`, …); `--help` lists them.
+
+### What this does not do
+
+The allowlist is a network boundary, not an identity. Anyone inside it calls
+without a credential, so usage cannot be attributed to a person, rate-limited
+per person, or revoked for one person. That is a deliberate trade — it is what
+makes the client config a bare URL — but it means the network has to be a
+boundary you actually trust, and it does not survive contact with a VPN that
+admits contractors, or a CI runner on the same subnet.
+
+If you need per-person attribution or quota, put an LLM gateway (LiteLLM,
+one-api, or whatever your organisation already runs) behind this server and give
+each caller their own virtual key there, or run this behind a reverse proxy that
+does SSO.
+
+One more thing worth knowing before you announce the URL: this service forwards
+whatever text it is given to an external provider. A shared endpoint with no
+credential is a data-egress path for everyone who can reach it.
+
+### Behind a reverse proxy
+
+`ask_all` with `rounds=2` is a long request — several models, several attempts
+each, at up to `COUNCIL_TIMEOUT` (180s) per call. Default proxy timeouts will
+cut it off well before the server is finished:
+
+```nginx
+location /mcp {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_buffering off;          # the transport streams; buffering defeats it
+    proxy_read_timeout 900s;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+Then start the server with `--trust-proxy` set to the proxy's address, or the
+allowlist will only ever see the proxy.
+
 ## Configuring the council
 
 Two layers, so several models can share one endpoint without repeating its
@@ -146,10 +241,10 @@ GLM_MODEL=glm-4.6
 GLM_FORMAT=anthropic
 ```
 
-Per member: `_BASE_URL`, `_API_KEY`, `_MODEL`, `_FORMAT`, `_LABEL`, `_MAX_TOKENS`,
-`_TEMPERATURE`, `_TIMEOUT`, `_RETRIES`, `_RETRY_BACKOFF`, `_HEADERS` (a JSON
-object), `_PROXY`, `_ENABLED`. Globally: `COUNCIL_TIMEOUT`, `COUNCIL_RETRIES`,
-`COUNCIL_RETRY_BACKOFF`, `COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`.
+Per member: `_BASE_URL`, `_API_KEY`, `_MODEL`, `_FORMAT`, `_LABEL`, `_WEIGHT`,
+`_MAX_TOKENS`, `_TEMPERATURE`, `_TIMEOUT`, `_RETRIES`, `_RETRY_BACKOFF`,
+`_HEADERS` (a JSON object), `_PROXY`, `_ENABLED`. Globally: `COUNCIL_TIMEOUT`,
+`COUNCIL_RETRIES`, `COUNCIL_RETRY_BACKOFF`, `COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`.
 
 Omit `COUNCIL_MODELS` and the roster defaults to `chatgpt,glm`, reading
 `CHATGPT_*` and `GLM_*`.
@@ -175,7 +270,8 @@ endpoint. Set `COUNCIL_CONFIG=/path/to/config.json`, or drop the file at
     }
   },
   "members": [
-    { "id": "gpt5",  "provider": "my-relay", "model": "gpt-5", "label": "GPT-5" },
+    { "id": "gpt5",  "provider": "my-relay", "model": "gpt-5", "label": "GPT-5",
+      "weight": 2 },
     { "id": "codex", "provider": "my-relay", "model": "gpt-5-codex", "temperature": 0.2 },
     { "id": "glm",   "provider": "zhipu",    "model": "glm-4.6" },
     { "id": "kimi",  "base_url": "https://api.moonshot.cn/v1",
@@ -209,6 +305,7 @@ The first three travel together as one unit — see the rule above.
 | `format` | provider, or a member with no provider | `openai` (default) or `anthropic` |
 | `model` | member | The model id sent to the endpoint |
 | `label` | member | Display name in answers; defaults to the id |
+| `weight` | member | How far this member's opinion carries. Default 1, max 10, `0` for advisory only. See [Weights](#weights) |
 | `max_tokens` | member | Anthropic format only, where it is required. Default 8192 |
 | `temperature` | member | Sent only when set |
 | `headers` | provider, member | Extra HTTP headers |
@@ -220,6 +317,43 @@ The first three travel together as one unit — see the rule above.
 
 `timeout`, `retries` and `retry_backoff` can also be set at the top level of the
 config file, as the default every member inherits.
+
+### Weights
+
+A council is rarely made of equals. `weight` says how far a member's opinion
+carries — everyone is `1` until you say otherwise, and only the ratios mean
+anything, so `2` and `1` is the same council as `10` and `5`.
+
+```json
+{ "id": "gpt5", "provider": "my-relay", "model": "gpt-5", "weight": 2 }
+```
+
+It changes nothing about the call. When the weights differ, `ask_all` labels each
+answer with its weight and ends the transcript with the ranking:
+
+```
+===== GPT-5 (gpt-5) · weight 2 =====
+...
+===== Local (qwen3-8b) · weight 0.5 =====
+...
+
+[WEIGHTS — GPT-5 2, GLM 1, Local 0.5]
+These are this council's standing priors on its members, not votes. ...
+```
+
+Weight belongs to the seat, not the endpoint, so a provider cannot set it: two
+members on one relay may be a frontier model and a small fast one. `0` means
+advisory — the member answers and is read, but its agreement counts for nothing.
+Anything unusable (a negative, a word) falls back to `1` rather than corrupting
+the ranking silently; `list_council` prints the effective value.
+
+**The members are never told each other's weights.** A model informed that it is
+outranked stops arguing and starts agreeing, which costs exactly the independent
+dissent a council is assembled to produce — so round two carries the other
+answers and not their standing. The weights are for whoever reads the transcript,
+and they are a prior, not a vote: they break ties and decide who carries the
+burden of proof. A specific, checkable reason from the lowest weight still beats
+a bare assertion from the highest.
 
 ### Wire format notes
 

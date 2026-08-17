@@ -12,7 +12,7 @@
 |------|------|
 | `ask(model, prompt)` | 按 id 问其中一个成员 |
 | `ask_all(prompt, models?, rounds?)` | 并行问全体（或指定的几个），回答并排返回。`rounds=2` 让它变成一场讨论 |
-| `list_council()` | 花名册：id、端点、调用预算、每个成员是否就绪。不发网络请求 |
+| `list_council()` | 花名册：id、端点、权重、调用预算、每个成员是否就绪。不发网络请求 |
 | `probe_models(model?)` | 打某个端点的 `/models` 路由，看它到底提供哪些模型 id |
 
 成员是无状态的，看不到你的对话，所以主席每次调用都会把需要的信息全部带上。跨模型互评正是靠这一点实现的 —— 把甲的回答塞进乙的 `prompt` 里。
@@ -22,6 +22,8 @@
 `ask_all(prompt, rounds=2)` 把这套互评直接做掉。第一轮就是平常的并行提问；第二轮再去找每个成员，这次把原问题连同第一轮的**全部**回答一起带上 —— 它自己的和别人的，原文照搬 —— 让它据此修订：对的就采纳，错的就改，仍然不同意的地方讲清楚为什么。返回的记录按轮次分块，谁改了口、谁守住了立场，一眼看得见。
 
 **把上一轮带回去，就是这件事的全部机制。** 成员在两次调用之间什么都不记得，不带回去的话，所谓第二轮不过是把同一个问题又问了一遍。最多 3 轮；每多一轮就多一次逐成员的调用，且 prompt 比上一轮更长 —— 想要一份意见普查用 1 轮，问题的价值在于分歧本身时用 2 轮。
+
+议会里的成员本来就少有旗鼓相当的，所以还可以给每个成员配[权重](#权重)。
 
 ### 失败重试
 
@@ -76,6 +78,68 @@ claude mcp add model-council -e GPT5_BASE_URL=... -e GPT5_API_KEY=... -- uvx mod
 
 任何能启动 stdio 服务器的客户端都行：运行 `uvx model-council-mcp`，传同样的环境变量。
 
+## 用 HTTP 服务整个团队
+
+上面所有装法都是每人一份：由各自的 MCP 客户端拉起进程，各自填自己的 key。`--http` 是另一种形态 —— 一份部署持有一套 key，服务整个团队，同事那边配一个 URL，一个秘密都不用知道。
+
+```bash
+model-council-mcp --http --host 0.0.0.0 --allow 10.20.0.0/16
+```
+
+同事把它当远程服务器加上，配置里没有任何敏感内容：
+
+```bash
+claude mcp add --transport http model-council http://council.internal:8000/mcp
+```
+
+```jsonc
+// Claude Desktop 和其他客户端
+{ "mcpServers": { "model-council": { "type": "http", "url": "http://council.internal:8000/mcp" } } }
+```
+
+`deploy/` 里有 [Dockerfile](deploy/Dockerfile)、[compose 文件](deploy/compose.yaml)和 [systemd unit](deploy/model-council.service)。
+
+### 谁可以调用
+
+stdio 模式下这个问题由操作系统回答：能拉起进程的人本来就有 key。HTTP 把这个前提拿掉了 —— 现在是一个端口挡在共享额度前面 —— 所以绑定非 loopback 地址时，没有 `--allow` 说明谁能访问，服务器会**拒绝启动**。loopback 不需要这个参数，永远放行。
+
+| 参数 | |
+|------|---|
+| `--allow` | CIDR、单个地址，或者别名 `private`（RFC1918 全部）、`loopback`、`any` |
+| `--trust-proxy` | 哪些反向代理的 `X-Forwarded-For` 可以采信 |
+| `--allow-origin` | 放行某个浏览器 `Origin`，可重复 |
+
+`--trust-proxy` 值得多看一眼。不设它，`X-Forwarded-For` 会被完全忽略，由对端地址说了算 —— 挂在 nginx 后面时那就是 nginx，白名单要么放行所有人、要么谁都不放行。设了它之后，真实客户端取的是转发链里**最右边那个不是可信代理**的地址，这正是让别人没法靠伪造 `X-Forwarded-For: 10.0.0.1` 直接混进来的原因。
+
+带 `Origin` 头的请求默认一律拒绝。MCP 客户端不是浏览器，不会发这个头；网页则一定会发。白名单放行的是整个办公网，而那上面每台机器都跑着浏览器，浏览器会替它当前打开的任意页面发请求 —— `Origin` 就是区分这两者的依据。
+
+每个参数都有对应的环境变量（`COUNCIL_ALLOW`、`COUNCIL_TRUST_PROXY`、`COUNCIL_HTTP_HOST`……），`--help` 里列全了。
+
+### 它做不到什么
+
+白名单是网络边界，不是身份。边界内的人不带任何凭据就能调用，所以用量无法归属到具体某个人，无法按人限流，也无法只吊销某一个人。这是有意的取舍 —— 正因如此同事那边的配置才能只是一个裸 URL —— 但代价是：这个网络必须是你真的信得过的边界。一个放外包进来的 VPN，或者同网段的 CI runner，都会让这个假设失效。
+
+如果你需要按人归属或者按人配额，在这个服务后面放一个 LLM 网关（LiteLLM、one-api，或者公司现成的那套），在网关上给每个调用方发各自的虚拟 key；或者把它挂在做 SSO 的反向代理后面。
+
+还有一件事，在你把 URL 发出去之前值得知道：这个服务会把收到的任意文本转发给外部厂商。一个不需要凭据的共享端点，对所有能访问到它的人来说都是一条数据出境通道。
+
+### 挂在反向代理后面
+
+`ask_all` 配 `rounds=2` 是个长请求 —— 多个模型、每个可能重试多次、每次调用最长 `COUNCIL_TIMEOUT`（180 秒）。代理的默认超时会在服务器干完活之前就把连接掐掉：
+
+```nginx
+location /mcp {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_buffering off;          # 这个传输是流式的，开缓冲等于白搭
+    proxy_read_timeout 900s;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+然后启动服务器时把 `--trust-proxy` 设成代理自己的地址，否则白名单永远只能看到代理。
+
 ## 配置议会
 
 两层结构，好处是多个模型共用一个端点时不必重复填凭据：
@@ -100,7 +164,7 @@ GLM_MODEL=glm-4.6
 GLM_FORMAT=anthropic
 ```
 
-每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_RETRIES`、`_RETRY_BACKOFF`、`_HEADERS`（JSON 对象）、`_PROXY`、`_ENABLED`。
+每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_WEIGHT`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_RETRIES`、`_RETRY_BACKOFF`、`_HEADERS`（JSON 对象）、`_PROXY`、`_ENABLED`。
 全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_RETRIES`、`COUNCIL_RETRY_BACKOFF`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`。
 
 不设 `COUNCIL_MODELS` 时，花名册默认是 `chatgpt,glm`，分别读 `CHATGPT_*` 和 `GLM_*`。
@@ -124,7 +188,8 @@ GLM_FORMAT=anthropic
     }
   },
   "members": [
-    { "id": "gpt5",  "provider": "my-relay", "model": "gpt-5", "label": "GPT-5" },
+    { "id": "gpt5",  "provider": "my-relay", "model": "gpt-5", "label": "GPT-5",
+      "weight": 2 },
     { "id": "codex", "provider": "my-relay", "model": "gpt-5-codex", "temperature": 0.2 },
     { "id": "glm",   "provider": "zhipu",    "model": "glm-4.6" },
     { "id": "kimi",  "base_url": "https://api.moonshot.cn/v1",
@@ -148,6 +213,7 @@ GLM_FORMAT=anthropic
 | `format` | provider，或未写 provider 的 member | `openai`（默认）或 `anthropic` |
 | `model` | member | 发给端点的模型 id |
 | `label` | member | 回答里显示的名字，默认用 id |
+| `weight` | member | 这个成员的意见有多重。默认 1，上限 10，`0` 表示只供参考。见[权重](#权重) |
 | `max_tokens` | member | 仅 anthropic 协议，该协议要求必填。默认 8192 |
 | `temperature` | member | 只在设置了的时候才发送 |
 | `headers` | provider、member | 额外的 HTTP 头 |
@@ -158,6 +224,30 @@ GLM_FORMAT=anthropic
 | `enabled` | member | `false` 可以临时停用某个成员而不删配置 |
 
 `timeout`、`retries`、`retry_backoff` 也可以写在配置文件的顶层，作为所有成员继承的默认值。
+
+### 权重
+
+议会里的成员本来就少有旗鼓相当的。`weight` 表示某个成员的意见有多重 —— 不写就都是 `1`，而且只有比值有意义，所以 `2` 和 `1` 与 `10` 和 `5` 是同一个议会。
+
+```json
+{ "id": "gpt5", "provider": "my-relay", "model": "gpt-5", "weight": 2 }
+```
+
+它不改变任何调用行为。**只有当权重确实不一致时**，`ask_all` 才会在每条回答上标出它的权重，并在记录末尾附上排名：
+
+```
+===== GPT-5 (gpt-5) · weight 2 =====
+...
+===== Local (qwen3-8b) · weight 0.5 =====
+...
+
+[WEIGHTS — GPT-5 2, GLM 1, Local 0.5]
+These are this council's standing priors on its members, not votes. ...
+```
+
+权重属于"席位"而不属于端点，所以 provider 不能设它：同一个中转站上的两个成员，可能一个是前沿模型、一个是小快模型。`0` 表示只供参考 —— 该成员照样作答、照样被读到，但它的赞同不计入任何支持。填了不能用的值（负数、一个词）会回落到 `1`，而不是悄悄把排名搞坏；`list_council` 会显示实际生效的值。
+
+**成员之间永远看不到彼此的权重。** 一个被告知"你不如别人"的模型会停止争辩、转而附和，而这恰好会赔掉组建议会本来要的那份独立异见 —— 所以第二轮带回去的是别人的回答，不是别人的分量。权重是给读这份记录的人看的，而且它是**先验，不是选票**：它用来打破平局、决定谁负举证责任。**来自最低权重的一条具体的、可核验的理由，依然胜过最高权重的一句空断言。**
 
 ### 协议注意事项
 

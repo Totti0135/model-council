@@ -37,7 +37,14 @@
   },
 
   "members": [
-    { "id": "gpt5", "provider": "my-relay", "model": "gpt-5", "label": "GPT-5" },
+    {
+      "$comment": [
+        "'weight' is how far this member's opinion carries against the others.",
+        "Default 1, max 10, 0 = advisory only. It changes nothing about the call:",
+        "ask_all reports it with the answers, whenever the council's weights differ."
+      ],
+      "id": "gpt5", "provider": "my-relay", "model": "gpt-5", "label": "GPT-5", "weight": 2
+    },
     { "id": "codex", "provider": "my-relay", "model": "gpt-5-codex", "temperature": 0.2 },
     { "id": "glm", "provider": "zhipu", "model": "glm-4.6", "max_tokens": 8192 },
 

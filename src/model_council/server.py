@@ -6,14 +6,24 @@ compare their answers, and synthesize a conclusion inside one conversation.
 
 Any number of models, from any mix of OpenAI-compatible and Anthropic-compatible
 endpoints. See config.py for where the roster comes from.
+
+Two ways to run it. Over stdio (the default) an MCP client launches one copy per
+user, and each user supplies their own keys. Over HTTP (`--http`) one deployment
+holds one set of keys and serves a team, who configure a URL and no secret at
+all; see access.py for what then decides who may reach it.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
+import os
 import sys
 from typing import Literal
 
 from mcp.server import MCPServer
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from model_council import __version__
 from model_council.config import Member, load_council
@@ -47,15 +57,42 @@ def _unknown(ids: list[str]) -> str:
             f"Available: {_roster()}. Call list_council for details.]")
 
 
-def _labelled(a: Answer) -> str:
-    return f"===== {a.member.label} ({a.member.model}) =====\n{a.text}"
+def _labelled(a: Answer, weighted: bool) -> str:
+    tag = f" · weight {a.member.weight:g}" if weighted else ""
+    return f"===== {a.member.label} ({a.member.model}){tag} =====\n{a.text}"
 
 
-def _round_block(n: int, total: int, what: str, answers: list[Answer]) -> str:
-    body = "\n\n".join(_labelled(a) for a in answers)
+def _round_block(n: int, total: int, what: str, answers: list[Answer],
+                 weighted: bool) -> str:
+    body = "\n\n".join(_labelled(a, weighted) for a in answers)
     if total == 1:                       # a single round needs no ceremony
         return body
     return f"########## ROUND {n} of {total} — {what} ##########\n\n{body}"
+
+
+def _weight_note(members: list[Member]) -> str:
+    """How to read the weights, addressed to whoever is reading the answers.
+
+    Two deliberate limits. It is produced only when the weights actually differ,
+    because a paragraph explaining a distinction that does not exist is worse
+    than silence. And it is shown to the caller, never to the members: a model
+    told it is outranked stops arguing and agrees, which costs exactly the
+    independent dissent the council was assembled to produce. `_revision_prompt`
+    therefore carries the other answers and not their weights.
+    """
+    ranked = sorted(members, key=lambda m: (-m.weight, m.id))
+    lines = [
+        "[WEIGHTS — " + ", ".join(f"{m.label} {m.weight:g}" for m in ranked) + "]",
+        "These are this council's standing priors on its members, not votes. Use them "
+        "to break ties and to place the burden of proof: a claim only a low-weight "
+        "member makes wants corroboration before you build on it. They do not settle "
+        "an argument — a specific, checkable reason from the lowest weight beats a "
+        "bare assertion from the highest, and members that agree are not independent "
+        "evidence when they share a training lineage.",
+    ]
+    if any(m.weight == 0 for m in ranked):
+        lines.append("Weight 0 is advisory: read the answer, do not count it as support.")
+    return "\n".join(lines)
 
 
 def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int) -> str:
@@ -127,16 +164,25 @@ asked twice. The transcript returns round by round, so you can see who moved and
 who held their ground.
 
 One round is a survey of opinion. Two is worth the extra latency and tokens when
-the answers are likely to disagree and the disagreement is the interesting part.""")
+the answers are likely to disagree and the disagreement is the interesting part.
+
+Members may carry different weights — how much this council trusts each one. When
+they do, every answer is labeled with its weight and the transcript ends with the
+ranking and how to read it. The members are never told each other's weights; a
+model told it is outranked stops arguing, and its dissent is what you came for.""")
 async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ignore[valid-type]
                   system: str | None = None, rounds: int = 1) -> str:
     members, unknown = COUNCIL.resolve(models)
     if not members:
         return _unknown(unknown) if unknown else "[no council members are configured]"
 
+    # Weights are relative, so a roster that agrees on one number says nothing —
+    # and on the default roster that is every roster. Stay silent unless asked.
+    weighted = len({m.weight for m in members}) > 1
+
     total = max(1, min(rounds, MAX_ROUNDS))
     answers = await asyncio.gather(*(ask_member(m, prompt, system) for m in members))
-    parts = [_round_block(1, total, "independent answers", answers)]
+    parts = [_round_block(1, total, "independent answers", answers, weighted)]
     note = ""
 
     for done in range(1, total):
@@ -150,16 +196,23 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
             *(ask_member(m, _revision_prompt(prompt, answers, m, done), system)
               for m in members))
         parts.append(_round_block(done + 1, total,
-                                  "revised after reading the other answers", answers))
+                                  "revised after reading the other answers", answers,
+                                  weighted))
 
     out = "\n\n".join(parts) + note
+    if weighted:
+        out += f"\n\n{_weight_note(members)}"
     return out + (f"\n\n{_unknown(unknown)}" if unknown else "")
 
 
 @mcp.tool()
 async def list_council() -> str:
-    """List the council's members: their ids, labels, target models, wire format,
-    endpoint, call budget, and whether each one is ready to answer.
+    """List the council's members: their ids, labels, target models, weights, wire
+    format, endpoint, call budget, and whether each one is ready to answer.
+
+    `weight` is how much this council trusts each member, relative to the others;
+    everyone is 1 unless the roster says otherwise, and `ask_all` reports it
+    alongside the answers whenever they differ.
 
     `tries` is how many attempts a call gets and how long each may take, so a
     member that is slow or that keeps being retried is visible here.
@@ -167,13 +220,13 @@ async def list_council() -> str:
     Cheap and local — makes no network calls. Use this to find out which ids you
     may pass to `ask` and `ask_all`, or to explain a configuration problem.
     """
-    rows = [("id", "label", "model", "format", "endpoint", "tries", "status")]
+    rows = [("id", "label", "model", "weight", "format", "endpoint", "tries", "status")]
     for m in COUNCIL.members.values():
         status = "ready" if m.configured else f"missing {', '.join(m.missing)}"
         if not m.enabled:
             status = f"disabled — {m.disabled_reason}" if m.disabled_reason else "disabled"
-        rows.append((m.id, m.label, m.model or "-", m.format, m.base_url or "-",
-                     f"{m.retries + 1} × {m.timeout:g}s", status))
+        rows.append((m.id, m.label, m.model or "-", f"{m.weight:g}", m.format,
+                     m.base_url or "-", f"{m.retries + 1} × {m.timeout:g}s", status))
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     table = "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
@@ -207,8 +260,84 @@ async def probe_models(model: ModelId | None = None) -> str:  # type: ignore[val
     return "\n".join(lines)
 
 
-def main() -> None:
-    """Console-script entry point: run over stdio, which is what MCP clients launch."""
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> Response:
+    """Is the deployment up, and does it have a council to offer.
+
+    Counts only, never the roster: an unauthenticated endpoint that names which
+    providers an organisation pays for is a small intelligence leak, and any
+    caller entitled to that detail can call `list_council` for it.
+
+    A server with no configured member answers 503. It is running, but every
+    tool it exposes would return a configuration error, and a deploy that is
+    broken in exactly that way should fail its health check rather than sit
+    there looking healthy.
+    """
+    ready = sum(m.configured and m.enabled for m in COUNCIL.members.values())
+    return JSONResponse(
+        {"status": "ok" if ready else "no members configured",
+         "version": __version__,
+         "members": {"ready": ready, "total": len(COUNCIL.members)}},
+        status_code=200 if ready else 503,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+LOCAL_BINDS = ("127.0.0.1", "localhost", "::1")
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _parse_args(argv: list[str] | None) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
+    p = argparse.ArgumentParser(
+        prog="model-council-mcp",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Model Council — an MCP server that seats other LLMs at your table.",
+        epilog="""\
+Every option also reads an environment variable, so a container or a systemd
+unit can configure the server without rewriting its command line.
+
+  stdio (default)   one copy per user, launched by their MCP client
+  --http            one deployment, one set of keys, many users
+
+examples:
+  model-council-mcp
+  model-council-mcp --http --host 0.0.0.0 --allow private
+  model-council-mcp --http --host 0.0.0.0 --allow 10.20.0.0/16,10.30.1.5
+  model-council-mcp --http --allow private --trust-proxy 10.0.0.9
+""")
+    p.add_argument("--http", action="store_true", default=_env_flag("COUNCIL_HTTP"),
+                   help="listen over Streamable HTTP instead of stdio [COUNCIL_HTTP]")
+    p.add_argument("--host", default=os.environ.get("COUNCIL_HTTP_HOST", "127.0.0.1"),
+                   help="address to bind (default: %(default)s) [COUNCIL_HTTP_HOST]")
+    p.add_argument("--port", type=int, default=int(os.environ.get("COUNCIL_HTTP_PORT", "8000")),
+                   help="port to bind (default: %(default)s) [COUNCIL_HTTP_PORT]")
+    p.add_argument("--path", default=os.environ.get("COUNCIL_HTTP_PATH", "/mcp"),
+                   help="URL path for the MCP endpoint (default: %(default)s) "
+                        "[COUNCIL_HTTP_PATH]")
+    p.add_argument("--allow", default=os.environ.get("COUNCIL_ALLOW", ""),
+                   help="networks that may call: CIDRs, addresses, or the names "
+                        "'private', 'loopback', 'any'. Loopback is always allowed "
+                        "[COUNCIL_ALLOW]")
+    p.add_argument("--trust-proxy", default=os.environ.get("COUNCIL_TRUST_PROXY", ""),
+                   help="reverse proxies whose X-Forwarded-For may be believed. "
+                        "Without this the peer address is the client, which behind "
+                        "a proxy is the proxy [COUNCIL_TRUST_PROXY]")
+    p.add_argument("--allow-origin", action="append", metavar="ORIGIN",
+                   default=[o for o in os.environ.get("COUNCIL_ALLOW_ORIGIN", "")
+                            .replace(",", " ").split() if o],
+                   help="permit browser requests from this Origin; repeatable. By "
+                        "default any request carrying an Origin is refused "
+                        "[COUNCIL_ALLOW_ORIGIN]")
+    p.add_argument("--version", action="version", version=f"model-council {__version__}")
+    return p, p.parse_args(argv)
+
+
+def _warn_about_config() -> None:
     for w in COUNCIL.warnings:
         print(f"model-council: warning: {w}", file=sys.stderr)
     if not any(m.configured for m in COUNCIL.members.values()):
@@ -219,6 +348,73 @@ def main() -> None:
               f"absolute .env path. A bare `.env` is only found when the server's "
               f"working directory contains it, which an MCP client does not "
               f"guarantee.", file=sys.stderr)
+
+
+def _serve_http(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Run over Streamable HTTP, behind an address allowlist."""
+    import uvicorn
+
+    from model_council import access
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    log = logging.getLogger("model_council")
+
+    try:
+        allow = access.parse_networks(args.allow)
+        trusted = access.parse_networks(args.trust_proxy)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # The refusal that makes the rest of this safe. This server answers with
+    # shared provider keys and asks the caller for no credential of its own, so
+    # reaching the port is the entire authorisation story — and an allowlist
+    # that can be left out by forgetting a flag is not one. Binding loopback is
+    # the one case that needs no flag, because the address already is the limit.
+    if not allow and args.host not in LOCAL_BINDS:
+        parser.error(
+            f"--http --host {args.host} serves the network, and this server answers "
+            f"with shared provider keys and no per-caller credential: whoever reaches "
+            f"the port spends your quota. Say who may reach it with --allow "
+            f"(e.g. --allow private, or --allow 10.20.0.0/16), or bind "
+            f"--host 127.0.0.1 and put something in front of it.")
+
+    if any(n.prefixlen == 0 for n in allow):
+        log.warning("--allow includes the whole internet; the only thing limiting "
+                    "who can spend this council's quota is whatever sits in front "
+                    "of this process")
+    if not trusted:
+        log.info("no --trust-proxy set: X-Forwarded-For is ignored and the peer "
+                 "address decides. Behind a reverse proxy, that is the proxy.")
+
+    _warn_about_config()
+
+    app = mcp.streamable_http_app(streamable_http_path=args.path, stateless_http=True)
+    gated = access.ClientGate(app, allow=allow, trusted_proxies=trusted,
+                              allowed_origins=args.allow_origin)
+
+    log.info("model-council %s serving %s on http://%s:%d%s",
+             __version__, ", ".join(COUNCIL.ids) or "(no members)",
+             args.host, args.port, args.path)
+
+    uvicorn.run(
+        gated,
+        host=args.host,
+        port=args.port,
+        # uvicorn rewrites scope["client"] from X-Forwarded-For by default, for
+        # peers in its own separate trust list. Two mechanisms deciding the same
+        # thing means --trust-proxy would sometimes not be what decided it, so
+        # this one is turned off and ClientGate is left as the only authority.
+        proxy_headers=False,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Console-script entry point."""
+    parser, args = _parse_args(argv)
+    if args.http:
+        _serve_http(parser, args)
+        return
+    _warn_about_config()
     mcp.run()
 
 

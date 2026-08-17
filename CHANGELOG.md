@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.5.0
+
+**`--http` serves a team from one deployment.** Until now the server only spoke
+stdio, which means one copy per person, launched by their own MCP client, holding
+their own keys. `model-council-mcp --http` listens over Streamable HTTP instead,
+so one deployment holds one set of keys and answers everyone — colleagues
+configure a URL and no secret at all:
+
+```bash
+model-council-mcp --http --host 0.0.0.0 --allow 10.20.0.0/16
+claude mcp add --transport http model-council http://council.internal:8000/mcp
+```
+
+Nothing about stdio changed; it is still the default and still what `uvx`
+launches. `deploy/` adds a Dockerfile, a compose file and a systemd unit.
+
+**The HTTP server will not start without being told who may call it.** Over
+stdio the operating system settled that question — whoever launched the process
+already had the keys. A port does not, and this one stands in front of shared
+provider quota, so binding a non-loopback address without `--allow` is a startup
+error rather than a default. `--allow` takes CIDRs, bare addresses, or the names
+`private`, `loopback` and `any`; loopback is always admitted.
+
+`--trust-proxy` names the reverse proxies whose `X-Forwarded-For` may be
+believed. Without it the header is ignored and the peer address decides, which
+behind nginx is nginx; with it the client is the rightmost hop that is not a
+trusted proxy, so a caller cannot write themselves onto the allowlist. uvicorn's
+own proxy-header handling is turned off, so exactly one mechanism decides this.
+
+Requests carrying an `Origin` header are refused unless `--allow-origin` names
+it. MCP clients are not browsers and send none; a page always does. An allowlist
+admits every machine on a network, and each one runs a browser that will issue
+requests for whatever page it has open.
+
+The allowlist is a network boundary and not an identity: callers inside it are
+anonymous, so usage cannot be attributed, throttled or revoked per person. The
+README says so plainly, and says what to reach for when that is not enough.
+
+**`GET /healthz`** reports liveness and how many members are configured — counts
+only, never the roster. It answers 503 while no member is configured, so a
+deploy that came up with an unreadable config file fails its health check
+instead of looking fine and erroring on every tool call.
+
+**Members can carry a `weight`.** A council is rarely made of equals, and until
+now the transcript gave no way to tell a frontier model's answer from a small
+local one's. `weight` says how far a member's opinion carries — default 1, max
+10, `0` for a seat that is read but counts for nothing — set per member via
+`<ID>_WEIGHT` or a `weight` field, and shown in `list_council`.
+
+It changes nothing about the call. When the weights differ, `ask_all` labels each
+answer with its weight and closes the transcript with the ranking; when they are
+all equal it says nothing, because a weight only means anything next to another
+one. Weight is a member field and not a provider field: two members on one relay
+can be a frontier model and a small fast one.
+
+The weights go to the caller and never to the members. A model told it is
+outranked stops arguing and starts agreeing, which costs exactly the independent
+dissent a council is assembled to produce — so round two still carries the other
+answers and not their standing. They are also stated to be a prior rather than a
+vote: they break ties and place the burden of proof, and a checkable reason from
+the lowest weight still beats a bare assertion from the highest.
+
 ## 0.4.1
 
 **0.4.0 told clients it was 0.3.0.** The version lives in four files and the

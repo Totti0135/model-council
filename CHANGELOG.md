@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.0
+
+**`ask_all` can run the discussion itself: `rounds=2`.** Round 1 is the usual
+parallel ask; round 2 goes back to every member carrying the question plus each
+answer from round 1 — its own and the others', verbatim — and asks it to revise.
+Carrying the previous round back is the entire mechanism: members are stateless,
+so a second round without it is just the same question asked twice. This was
+possible before by hand, by pasting answers into `ask` prompts, and now it is one
+argument. Up to 3 rounds; the transcript returns round by round; failed answers
+are left out of what the others are shown, since an error message is not an
+opinion worth critiquing. `rounds=1` is the default and its output is byte-for-byte
+what it always was.
+
+**Transient failures are retried instead of reported.** HTTP 429 and 5xx, and
+dropped or timed-out connections, get 2 more attempts by default, backing off
+exponentially from 1s with jitter. A `Retry-After` header beats that curve, and
+one asking for longer than 30s ends the call with what it asked for rather than
+sitting on it. Failures that will not change — 401, 404, a malformed response
+body — are still reported on the first try, because asking again only spends the
+same quota to be told the same thing. Tunable per member or per provider with
+`retries` and `retry_backoff` (or `<ID>_RETRIES` / `COUNCIL_RETRIES`); `retries: 0`
+restores the old behaviour.
+
+Note the interaction with `timeout`, which is per attempt: the default budget is
+now up to 3 × 180s rather than a flat 180s. `list_council` gained a `tries`
+column showing each member's, and a member that exhausts its attempts says
+`gave up after N attempts`.
+
+**A response with no usable content is now a failure, not an answer.** An empty
+completion or an unparseable body used to be returned as the member's answer,
+which meant it could be fed to another model as an opinion. It is now attributed
+(`[GPT-5 empty response]` rather than a bare `[empty response]`) and excluded
+from later rounds.
+
 ## 0.3.0
 
 **Ships as a desktop extension.** `model-council-<version>.mcpb` is attached to

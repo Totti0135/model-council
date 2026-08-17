@@ -11,11 +11,23 @@
 | 工具 | 作用 |
 |------|------|
 | `ask(model, prompt)` | 按 id 问其中一个成员 |
-| `ask_all(prompt, models?)` | 并行问全体（或指定的几个），回答并排返回 |
-| `list_council()` | 花名册：id、端点、每个成员是否就绪。不发网络请求 |
+| `ask_all(prompt, models?, rounds?)` | 并行问全体（或指定的几个），回答并排返回。`rounds=2` 让它变成一场讨论 |
+| `list_council()` | 花名册：id、端点、调用预算、每个成员是否就绪。不发网络请求 |
 | `probe_models(model?)` | 打某个端点的 `/models` 路由，看它到底提供哪些模型 id |
 
 成员是无状态的，看不到你的对话，所以主席每次调用都会把需要的信息全部带上。跨模型互评正是靠这一点实现的 —— 把甲的回答塞进乙的 `prompt` 里。
+
+### 多轮讨论
+
+`ask_all(prompt, rounds=2)` 把这套互评直接做掉。第一轮就是平常的并行提问；第二轮再去找每个成员，这次把原问题连同第一轮的**全部**回答一起带上 —— 它自己的和别人的，原文照搬 —— 让它据此修订：对的就采纳，错的就改，仍然不同意的地方讲清楚为什么。返回的记录按轮次分块，谁改了口、谁守住了立场，一眼看得见。
+
+**把上一轮带回去，就是这件事的全部机制。** 成员在两次调用之间什么都不记得，不带回去的话，所谓第二轮不过是把同一个问题又问了一遍。最多 3 轮；每多一轮就多一次逐成员的调用，且 prompt 比上一轮更长 —— 想要一份意见普查用 1 轮，问题的价值在于分歧本身时用 2 轮。
+
+### 失败重试
+
+会话式失败（HTTP 429、5xx，以及连接中断或超时）会先重试再上报。退避从 1 秒起指数增长并带抖动；端点自己给的 `Retry-After` 优先于这条曲线 —— 除非它要求等待超过 30 秒，那就直接结束并说明，而不是干等在那里。**再试也不会变的失败 —— 401、404、响应体格式不对 —— 立即上报**：重试它们只是花掉同样的额度换来同样的回答。默认重试 2 次；设 `retries: 0` 可回到过去"一次失败即终结"的行为。
+
+某个成员把次数用完仍然失败时，它的错误就作为该成员的"回答"返回，议会其余成员照常作答。
 
 ## 安装
 
@@ -88,8 +100,8 @@ GLM_MODEL=glm-4.6
 GLM_FORMAT=anthropic
 ```
 
-每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_HEADERS`（JSON 对象）、`_PROXY`、`_ENABLED`。
-全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`。
+每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_RETRIES`、`_RETRY_BACKOFF`、`_HEADERS`（JSON 对象）、`_PROXY`、`_ENABLED`。
+全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_RETRIES`、`COUNCIL_RETRY_BACKOFF`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`。
 
 不设 `COUNCIL_MODELS` 时，花名册默认是 `chatgpt,glm`，分别读 `CHATGPT_*` 和 `GLM_*`。
 
@@ -139,9 +151,13 @@ GLM_FORMAT=anthropic
 | `max_tokens` | member | 仅 anthropic 协议，该协议要求必填。默认 8192 |
 | `temperature` | member | 只在设置了的时候才发送 |
 | `headers` | provider、member | 额外的 HTTP 头 |
-| `timeout` | provider、member | 秒。默认 180 |
+| `timeout` | provider、member | 秒，单次尝试的上限。默认 180 |
+| `retries` | provider、member | 会话式失败额外可重试的次数。默认 2，上限 5，填 `0` 关闭 |
+| `retry_backoff` | provider、member | 第一次重试前等待的秒数，之后翻倍。默认 1 |
 | `proxy` | provider、member | 省略则跟随 `HTTP_PROXY`/`HTTPS_PROXY`；`false` 表示直连；填 URL 则走该代理 |
 | `enabled` | member | `false` 可以临时停用某个成员而不删配置 |
+
+`timeout`、`retries`、`retry_backoff` 也可以写在配置文件的顶层，作为所有成员继承的默认值。
 
 ### 协议注意事项
 
@@ -157,7 +173,7 @@ GLM_FORMAT=anthropic
 
 - *"你先自己回答，然后 `ask_all`，给我一个表格列出你们几个在哪里一致、哪里分歧。"*
 - *"把这个问题问 gpt5 和 glm，然后点评两边的回答，告诉我哪个更对、为什么。"*
-- *"第一轮 `ask_all`。第二轮把其他成员的回答给每一个看，让它修订。然后给我合并后的最终答案。"*
+- *"这个问题跑两轮 `ask_all`，然后告诉我谁改了口、真正让它改口的是什么。"*
 - *"只问 glm —— 这个文件我想要个第二意见。"*
 
 ## 本地开发
@@ -181,6 +197,8 @@ uv run python tests/test_smoke.py
 - **HTTP 401** —— key 不对，或者被供应方禁用了。
 - **HTTP 404** —— `base_url` 不对，或者该端点的 `format` 设错了。
 - **模型 id 被拒** —— 跑 `probe_models`。
+- **某个成员回了 `gave up after N attempts`** —— 它每一次都失败了，错误文本是端点最后一次给的那条。`list_council` 会以 `尝试次数 × 超时` 的形式显示每个成员的预算。
+- **一次调用比超时时间长得多** —— 重试是乘上去的：3 次尝试、每次 180 秒，最坏情况约 9 分钟，还要加上退避等待。希望某个成员"快速失败"的话，把它的 `timeout` 或 `retries` 调小。
 
 ## 许可
 

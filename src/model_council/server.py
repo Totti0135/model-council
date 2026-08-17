@@ -17,9 +17,14 @@ from mcp.server import MCPServer
 
 from model_council import __version__
 from model_council.config import Member, load_council
-from model_council.providers import ask_member, probe_member
+from model_council.providers import Answer, ask_member, probe_member
 
 COUNCIL = load_council()
+
+# Each extra round costs another full call per member, and the prompt carries
+# every previous answer, so it costs more than the one before it. Two is the
+# useful shape; three is the most anyone should pay by accident.
+MAX_ROUNDS = 3
 
 # Constrain `model` to the ids this install actually has, so the caller cannot
 # invent one: the schema carries an enum, and a wrong value is rejected with the
@@ -42,8 +47,44 @@ def _unknown(ids: list[str]) -> str:
             f"Available: {_roster()}. Call list_council for details.]")
 
 
-def _labelled(m: Member, answer: str) -> str:
-    return f"===== {m.label} ({m.model}) =====\n{answer}"
+def _labelled(a: Answer) -> str:
+    return f"===== {a.member.label} ({a.member.model}) =====\n{a.text}"
+
+
+def _round_block(n: int, total: int, what: str, answers: list[Answer]) -> str:
+    body = "\n\n".join(_labelled(a) for a in answers)
+    if total == 1:                       # a single round needs no ceremony
+        return body
+    return f"########## ROUND {n} of {total} — {what} ##########\n\n{body}"
+
+
+def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int) -> str:
+    """What a member is shown in a later round.
+
+    Members are stateless and share no conversation, so a second round is only a
+    discussion if the first one travels with it: the question restated, this
+    member's own answer, and every other member's — verbatim, and only the ones
+    that actually came back. An error string is not an opinion worth critiquing.
+    """
+    mine = next((a for a in answers if a.member.id == me.id and a.ok), None)
+    blocks = [
+        f"Several AI models were asked the same question independently. Round {done} is "
+        f"finished and its answers are below; you are now in round {done + 1}.",
+        f"--- THE QUESTION ---\n{question}",
+        f"--- YOUR OWN ROUND-{done} ANSWER ---\n"
+        + (mine.text if mine else "(you did not answer)"),
+    ]
+    blocks += [f"--- ROUND-{done} ANSWER FROM {a.member.label} ---\n{a.text}"
+               for a in answers if a.ok and a.member.id != me.id]
+    blocks.append(
+        "Now give your final answer to the question above. Weigh the other answers on "
+        "their merits: take what is right, correct anything you got wrong, and say "
+        "plainly where you still disagree and why. Agreement is not the goal — do not "
+        "abandon a position you believe is correct just because you are outnumbered, "
+        "and do not manufacture disagreement either. Answer in full: your reply is read "
+        "on its own, not as a diff against the previous round."
+    )
+    return "\n\n".join(blocks)
 
 
 # --------------------------------------------------------------------------- #
@@ -68,7 +109,7 @@ async def ask(model: ModelId, prompt: str, system: str | None = None) -> str:  #
     m = COUNCIL.get(model)
     if m is None:
         return _unknown([model])
-    return await ask_member(m, prompt, system)
+    return (await ask_member(m, prompt, system)).text
 
 
 @mcp.tool(description="""Ask several members the SAME prompt in parallel, returning
@@ -77,33 +118,62 @@ their answers side by side and labeled by model.
 By default every configured member answers. Pass `models` to ask only some of
 them; the schema lists the valid ids.
 
-Use this for the first round of a multi-model question. Afterwards you can
-compare the answers yourself, or feed them back through `ask` so each member
-revises its answer in light of the others.""")
+`rounds` (1-3, default 1) runs a real discussion. With `rounds=2` the members
+first answer independently, then each is asked again — this time carrying the
+question plus every answer from round 1, its own and the others', verbatim — and
+asked to revise. Members are stateless, so carrying the previous round back to
+them is the whole mechanism: without it a second round is just the same question
+asked twice. The transcript returns round by round, so you can see who moved and
+who held their ground.
+
+One round is a survey of opinion. Two is worth the extra latency and tokens when
+the answers are likely to disagree and the disagreement is the interesting part.""")
 async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ignore[valid-type]
-                  system: str | None = None) -> str:
+                  system: str | None = None, rounds: int = 1) -> str:
     members, unknown = COUNCIL.resolve(models)
     if not members:
         return _unknown(unknown) if unknown else "[no council members are configured]"
+
+    total = max(1, min(rounds, MAX_ROUNDS))
     answers = await asyncio.gather(*(ask_member(m, prompt, system) for m in members))
-    out = "\n\n".join(_labelled(m, a) for m, a in zip(members, answers))
+    parts = [_round_block(1, total, "independent answers", answers)]
+    note = ""
+
+    for done in range(1, total):
+        answered = sum(a.ok for a in answers)
+        if answered < 2:
+            note = (f"\n\n[stopped after round {done}: a discussion needs at least two "
+                    f"answers to put in front of each other, and this round produced "
+                    f"{answered}.]")
+            break
+        answers = await asyncio.gather(
+            *(ask_member(m, _revision_prompt(prompt, answers, m, done), system)
+              for m in members))
+        parts.append(_round_block(done + 1, total,
+                                  "revised after reading the other answers", answers))
+
+    out = "\n\n".join(parts) + note
     return out + (f"\n\n{_unknown(unknown)}" if unknown else "")
 
 
 @mcp.tool()
 async def list_council() -> str:
     """List the council's members: their ids, labels, target models, wire format,
-    endpoint, and whether each one is ready to answer.
+    endpoint, call budget, and whether each one is ready to answer.
+
+    `tries` is how many attempts a call gets and how long each may take, so a
+    member that is slow or that keeps being retried is visible here.
 
     Cheap and local — makes no network calls. Use this to find out which ids you
     may pass to `ask` and `ask_all`, or to explain a configuration problem.
     """
-    rows = [("id", "label", "model", "format", "endpoint", "status")]
+    rows = [("id", "label", "model", "format", "endpoint", "tries", "status")]
     for m in COUNCIL.members.values():
         status = "ready" if m.configured else f"missing {', '.join(m.missing)}"
         if not m.enabled:
             status = f"disabled — {m.disabled_reason}" if m.disabled_reason else "disabled"
-        rows.append((m.id, m.label, m.model or "-", m.format, m.base_url or "-", status))
+        rows.append((m.id, m.label, m.model or "-", m.format, m.base_url or "-",
+                     f"{m.retries + 1} × {m.timeout:g}s", status))
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     table = "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)

@@ -7,6 +7,14 @@
     "committed without the keys in it."
   ],
 
+  "$comment2": [
+    "timeout, retries and retry_backoff may also be set at the top level, as the",
+    "default every provider and member inherits. These are the built-in values."
+  ],
+  "timeout": 180,
+  "retries": 2,
+  "retry_backoff": 1,
+
   "providers": {
     "my-relay": {
       "base_url": "https://your-openai-compatible-host/v1",
@@ -41,7 +49,14 @@
       "model": "kimi-k2"
     },
 
-    { "id": "inhouse", "provider": "internal", "model": "some-internal-model" },
+    {
+      "$comment": "a member you would rather have fail fast than retry for minutes",
+      "id": "inhouse",
+      "provider": "internal",
+      "model": "some-internal-model",
+      "timeout": 60,
+      "retries": 1
+    },
 
     { "id": "spare", "provider": "my-relay", "model": "some-other-model", "enabled": false }
   ]

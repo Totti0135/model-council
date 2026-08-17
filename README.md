@@ -18,13 +18,42 @@ self-run gateway, a local server, or several of each.
 | Tool | What it does |
 |------|--------------|
 | `ask(model, prompt)` | Ask one member by id |
-| `ask_all(prompt, models?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side |
-| `list_council()` | The roster: ids, endpoints, and whether each member is ready. No network calls |
+| `ask_all(prompt, models?, rounds?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion |
+| `list_council()` | The roster: ids, endpoints, call budget, and whether each member is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
 Members are stateless and cannot see your conversation, so the chair passes
 everything they need in each call. That is exactly what makes cross-review work:
 it puts one member's answer inside another's `prompt`.
+
+### Rounds
+
+`ask_all(prompt, rounds=2)` runs that cross-review for you. Round 1 is the usual
+parallel ask. Round 2 goes back to each member carrying the question plus every
+answer from round 1 — its own and the others', verbatim — and asks it to revise:
+take what is right, correct what is not, and say where it still disagrees and
+why. The transcript comes back round by round, so you can see who moved and who
+held their ground.
+
+Carrying the previous round back is the whole mechanism. Members remember
+nothing between calls, so without it a second round is just the same question
+asked twice. Up to 3 rounds; each one costs another call per member and a longer
+prompt than the last, so 1 is right for a survey of opinion and 2 for a question
+where the disagreement is the interesting part.
+
+### Retries
+
+A call that fails transiently is retried before it is reported: HTTP 429 and
+5xx, and dropped or timed-out connections. Backoff is exponential from 1s with
+jitter, and a `Retry-After` header wins over that curve — unless it asks for
+longer than 30s, in which case the call stops and says so rather than sitting on
+it. Failures that will not change on a second look — 401, 404, a malformed
+response body — are reported immediately; retrying them only spends the same
+quota to be told the same thing. Defaults to 2 retries; set `retries: 0` for the
+old single-shot behaviour.
+
+A member that exhausts its attempts returns its error as that member's answer,
+so the rest of the council still answers.
 
 ## Install
 
@@ -118,8 +147,9 @@ GLM_FORMAT=anthropic
 ```
 
 Per member: `_BASE_URL`, `_API_KEY`, `_MODEL`, `_FORMAT`, `_LABEL`, `_MAX_TOKENS`,
-`_TEMPERATURE`, `_TIMEOUT`, `_HEADERS` (a JSON object), `_PROXY`, `_ENABLED`.
-Globally: `COUNCIL_TIMEOUT`, `COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`.
+`_TEMPERATURE`, `_TIMEOUT`, `_RETRIES`, `_RETRY_BACKOFF`, `_HEADERS` (a JSON
+object), `_PROXY`, `_ENABLED`. Globally: `COUNCIL_TIMEOUT`, `COUNCIL_RETRIES`,
+`COUNCIL_RETRY_BACKOFF`, `COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`.
 
 Omit `COUNCIL_MODELS` and the roster defaults to `chatgpt,glm`, reading
 `CHATGPT_*` and `GLM_*`.
@@ -182,9 +212,14 @@ The first three travel together as one unit — see the rule above.
 | `max_tokens` | member | Anthropic format only, where it is required. Default 8192 |
 | `temperature` | member | Sent only when set |
 | `headers` | provider, member | Extra HTTP headers |
-| `timeout` | provider, member | Seconds. Default 180 |
+| `timeout` | provider, member | Seconds, per attempt. Default 180 |
+| `retries` | provider, member | Extra attempts a transient failure gets. Default 2, max 5, `0` to disable |
+| `retry_backoff` | provider, member | Seconds before the first retry, doubling from there. Default 1 |
 | `proxy` | provider, member | Omit to follow `HTTP_PROXY`/`HTTPS_PROXY`; `false` to connect directly; a URL to use that proxy |
 | `enabled` | member | `false` parks a member without deleting its config |
+
+`timeout`, `retries` and `retry_backoff` can also be set at the top level of the
+config file, as the default every member inherits.
 
 ### Wire format notes
 
@@ -211,7 +246,7 @@ Things worth typing to the chair:
 
 - *"Answer this yourself, then `ask_all` and give me a table of where you all agree and disagree."*
 - *"Ask gpt5 and glm this, then critique both answers and tell me which is more correct and why."*
-- *"Round 1: `ask_all`. Round 2: show each member the others' answers and ask it to revise. Then give me the merged answer."*
+- *"Run two rounds of `ask_all` on this, then tell me who changed their mind and what actually settled it."*
 - *"Ask only glm — I want a second opinion on this one file."*
 
 ## Local development
@@ -240,6 +275,12 @@ finishes with a live round-trip. To point a client at your working copy, use the
 - **HTTP 401** — wrong key, or a key the provider has disabled.
 - **HTTP 404** — wrong `base_url`, or the wrong `format` for that endpoint.
 - **The model id is rejected** — run `probe_models`.
+- **A member says `gave up after N attempts`** — it failed transiently every
+  time. The error text is the last one the endpoint gave. `list_council` shows
+  each member's budget as `attempts × timeout`.
+- **A call takes far longer than the timeout** — retries multiply it: three
+  attempts at 180s each is a worst case of ~9 minutes plus backoff. Lower
+  `timeout`, or `retries`, for a member you would rather have fail fast.
 
 ## License
 

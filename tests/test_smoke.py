@@ -4,8 +4,9 @@
     python tests/test_smoke.py
 
 Verifies the tool surface, both configuration sources, provider inheritance and
-${ENV} expansion, and graceful degradation when a member is unconfigured. If a
-usable .env is present it finishes with a live round-trip through ask_all.
+${ENV} expansion, retry behaviour, multi-round discussion, and graceful
+degradation when a member is unconfigured. If a usable .env is present it
+finishes with a live round-trip through ask_all.
 """
 from __future__ import annotations
 
@@ -15,6 +16,8 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+
+import httpx
 
 from model_council import config as cfg
 
@@ -199,6 +202,186 @@ def test_proxy_policy() -> None:
     print("ok  proxy policy (inherit / direct / explicit, config and env)")
 
 
+def test_retry_settings() -> None:
+    """The retry policy is inheritable, overridable per member, and clamped."""
+    doc = {
+        "retries": 1,
+        "providers": {
+            "flaky": {"base_url": "https://f/v1", "api_key": "k",
+                      "retries": 4, "retry_backoff": 0.5},
+        },
+        "members": [
+            {"id": "inherit", "provider": "flaky", "model": "m"},
+            {"id": "once", "provider": "flaky", "model": "m", "retries": 0},
+            {"id": "greedy", "base_url": "https://g/v1", "api_key": "k", "model": "m",
+             "retries": 99},
+            {"id": "plain", "base_url": "https://p/v1", "api_key": "k", "model": "m"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    assert not c.warnings, c.warnings                  # retry fields are not typos
+    assert c.members["inherit"].retries == 4           # from the provider
+    assert c.members["inherit"].retry_backoff == 0.5
+    assert c.members["once"].retries == 0              # single-shot on request
+    assert c.members["greedy"].retries == cfg._MAX_RETRIES   # a typo cannot cost 100 calls
+    assert c.members["plain"].retries == 1             # the file's top-level default
+
+    with env(COUNCIL_MODELS="a,b", COUNCIL_RETRIES="3", B_RETRIES="0", B_RETRY_BACKOFF="2"):
+        e = cfg.load_council()
+    assert (e.members["a"].retries, e.members["a"].retry_backoff) == (3, 1.0)
+    assert (e.members["b"].retries, e.members["b"].retry_backoff) == (0, 2.0)
+
+    with env():
+        assert cfg.load_council().members["glm"].retries == 2   # built-in default
+    print("ok  retry settings (provider inheritance, per-member override, clamp)")
+
+
+# --------------------------------------------------------------------------- #
+# A stub endpoint, so retry behaviour can be tested without a network.
+# --------------------------------------------------------------------------- #
+def _ok() -> httpx.Response:
+    return httpx.Response(200, json={"choices": [{"message": {"content": "pong"}}]})
+
+
+def _status(code: int, headers: dict | None = None):
+    return lambda: httpx.Response(code, text="busy", headers=headers or {})
+
+
+def _boom():
+    def make() -> httpx.Response:
+        raise httpx.ConnectError("boom")
+    return make
+
+
+@contextmanager
+def serving(*outcomes):
+    """Serve the given outcomes in order, repeating the last once they run out.
+
+    Yields the list of requests actually made, which is the thing under test:
+    how many attempts a given failure was worth.
+    """
+    from model_council import providers as p
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return outcomes[min(len(seen) - 1, len(outcomes) - 1)]()
+
+    saved = p._client
+    p._client = lambda m, timeout=None: httpx.AsyncClient(
+        transport=httpx.MockTransport(handler))
+    try:
+        yield seen
+    finally:
+        p._client = saved
+
+
+async def test_retry_transport() -> None:
+    """Transient failures get another attempt; permanent ones do not."""
+    from model_council.providers import ask_member
+
+    def member(**kw) -> cfg.Member:
+        # retry_backoff=0 keeps the test instant — the sleep still happens.
+        return cfg.Member(id="x", model="m", base_url="https://h/v1", api_key="k",
+                          label="X", **{"retry_backoff": 0, **kw})
+
+    with serving(_status(503), _status(503), _ok) as seen:
+        a = await ask_member(member(), "hi")
+    assert a.ok and a.text == "pong" and a.attempts == 3, a
+    assert len(seen) == 3, len(seen)
+
+    with serving(_status(401)) as seen:
+        a = await ask_member(member(), "hi")
+    assert not a.ok and "HTTP 401" in a.text, a.text
+    assert len(seen) == 1, "a rejected key was asked again"
+
+    with serving(_boom()) as seen:
+        a = await ask_member(member(), "hi")
+    assert not a.ok and "gave up after 3 attempts" in a.text, a.text
+    assert len(seen) == 3, len(seen)
+
+    # The endpoint's own pacing wins over our backoff curve — but one longer
+    # than we are willing to wait ends the call instead of burning the
+    # remaining attempts to be told 'no' again.
+    with serving(_status(429, {"retry-after": "3600"})) as seen:
+        a = await ask_member(member(), "hi")
+    assert len(seen) == 1 and "3600s" in a.text, (len(seen), a.text)
+
+    with serving(_status(429, {"retry-after": "0"}), _ok) as seen:
+        a = await ask_member(member(), "hi")
+    assert a.ok and len(seen) == 2, (a, len(seen))
+
+    with serving(_status(503)) as seen:                 # opting out entirely
+        a = await ask_member(member(retries=0), "hi")
+    assert len(seen) == 1 and "gave up" not in a.text, (len(seen), a.text)
+
+    # A 200 carrying no usable answer is a failure, not an answer — and not
+    # one worth paying to repeat.
+    with serving(lambda: httpx.Response(200, json={"choices": []})) as seen:
+        a = await ask_member(member(), "hi")
+    assert not a.ok and len(seen) == 1, (a, len(seen))
+    assert "X" in a.text and "unexpected response shape" in a.text, a.text
+    print("ok  retry transport (5xx and network retried, 4xx and bad payloads not)")
+
+
+async def test_rounds_carry_the_previous_answers() -> None:
+    """A second round is only a discussion if round 1 travels with it."""
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    alpha = cfg.Member(id="a", model="m-a", base_url="https://h/v1", api_key="k", label="Alpha")
+    beta = cfg.Member(id="b", model="m-b", base_url="https://h/v1", api_key="k", label="Beta")
+    seen: list[tuple[str, str]] = []
+
+    async def answering(m, prompt, system=None):
+        seen.append((m.id, prompt))
+        n = sum(1 for i, _ in seen if i == m.id)
+        return Answer(m, f"{m.label} says {n}", ok=True)
+
+    async def only_alpha_answers(m, prompt, system=None):
+        seen.append((m.id, prompt))
+        return Answer(m, f"{m.label} answer", ok=(m.id == "a"))
+
+    saved = s.COUNCIL, s.ask_member
+    s.COUNCIL = cfg.Council({"a": alpha, "b": beta}, "test")
+    try:
+        s.ask_member = answering
+        one = await s.ask_all("Why is the sky blue?")
+        assert "ROUND" not in one, "a single round should look exactly as it always did"
+        assert "Alpha says 1" in one and "Beta says 1" in one, one
+        assert [p for _, p in seen] == ["Why is the sky blue?"] * 2
+
+        seen.clear()
+        two = await s.ask_all("Why is the sky blue?", rounds=2)
+        assert len(seen) == 4, seen
+        round2 = dict(seen[2:])
+        assert "Why is the sky blue?" in round2["a"], "the question was not restated"
+        assert "Alpha says 1" in round2["a"], "Alpha never saw its own first answer"
+        assert "Beta says 1" in round2["a"], "Alpha never saw the other answer"
+        assert "Beta says 1" in round2["b"] and "Alpha says 1" in round2["b"]
+        assert "ROUND 1 of 2" in two and "ROUND 2 of 2" in two, two
+        assert "Alpha says 2" in two and "Alpha says 1" in two, "a round is missing"
+
+        seen.clear()                                   # clamped, not unbounded
+        await s.ask_all("q", rounds=9)
+        assert len(seen) == 2 * s.MAX_ROUNDS, len(seen)
+
+        seen.clear()                                   # nothing to discuss
+        s.ask_member = only_alpha_answers
+        stopped = await s.ask_all("q", rounds=2)
+        assert len(seen) == 2, "a second round ran with only one answer to show"
+        assert "stopped after round 1" in stopped, stopped
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  rounds (round 2 carries every round-1 answer, and stops when it cannot)")
+
+
 def test_registry_metadata_agrees() -> None:
     """server.json must name the same server the README claims ownership of.
 
@@ -308,6 +491,7 @@ async def test_tools() -> None:
     subset = tools["ask_all"].input_schema["properties"]["models"]
     assert any(o.get("items", {}).get("enum") == s.COUNCIL.ids
                for o in subset["anyOf"]), subset
+    assert tools["ask_all"].input_schema["properties"]["rounds"]["default"] == 1
 
     bad = await s.ask(model="does-not-exist", prompt="hi")
     assert "unknown model id" in bad, bad      # the fallback path still holds
@@ -329,10 +513,13 @@ def main() -> None:
     test_file_config()
     test_connection_is_atomic()
     test_proxy_policy()
+    test_retry_settings()
     test_registry_metadata_agrees()
     test_explicit_beats_discovered()
     test_shipped_example_is_valid()
     test_missing_file_falls_back()
+    asyncio.run(test_retry_transport())
+    asyncio.run(test_rounds_carry_the_previous_answers())
     asyncio.run(test_tools())
 
 

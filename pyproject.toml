@@ -1,6 +1,6 @@
 [project]
 name = "model-council-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "An MCP server that lets your assistant consult other LLMs — ask them, compare their answers, and synthesize a conclusion."
 readme = "README.md"
 requires-python = ">=3.10"

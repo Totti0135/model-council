@@ -39,10 +39,15 @@ LEGACY_DEFAULTS: dict[str, dict] = {
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 # Connection fields a member may inherit from its provider.
-_PROVIDER_FIELDS = {"base_url", "api_key", "format", "headers", "timeout", "proxy"}
+_PROVIDER_FIELDS = {"base_url", "api_key", "format", "headers", "timeout", "proxy",
+                    "retries", "retry_backoff"}
 _MEMBER_FIELDS = _PROVIDER_FIELDS | {
     "id", "model", "label", "max_tokens", "temperature", "enabled",
 }
+
+# A ceiling on retries, because the cost of a typo here is paid in real requests
+# to a real provider: `"retries": 50` should not turn one question into fifty.
+_MAX_RETRIES = 5
 
 # Who you talk to, and how you prove who you are. These three travel together:
 # a member that names a provider may not override any of them, because taking
@@ -91,6 +96,11 @@ class Member:
     temperature: float | None = None
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float = 180.0
+    # Extra attempts a transient failure gets — a 429, a 5xx, a dropped
+    # connection — and the first backoff step in seconds, doubling from there.
+    # 0 restores the old behaviour of reporting the first failure as final.
+    retries: int = 2
+    retry_backoff: float = 1.0
     # None = follow the environment's proxy settings (the default);
     # False = connect directly, ignoring them; a URL = use that proxy.
     proxy: str | bool | None = None
@@ -101,6 +111,8 @@ class Member:
         self.label = self.label or self.id
         self.base_url = (self.base_url or "").rstrip("/")
         self.format = (self.format or "openai").lower()
+        self.retries = max(0, min(int(self.retries), _MAX_RETRIES))
+        self.retry_backoff = max(0.0, float(self.retry_backoff))
 
     @property
     def configured(self) -> bool:
@@ -166,7 +178,22 @@ def _env_proxy(prefix: str) -> str | bool | None:
     return False if raw.lower() in _DIRECT else raw
 
 
-def _member_from_env(member_id: str, defaults: dict, default_timeout: float) -> Member:
+def _defaults(data: dict | None = None) -> dict:
+    """Council-wide fallbacks for the per-call knobs.
+
+    A config file's top level if it sets them, else the environment, else the
+    built-in values. Each member may still override any of them.
+    """
+    data = data or {}
+    return {
+        "timeout": float(data.get("timeout", os.environ.get("COUNCIL_TIMEOUT", "180"))),
+        "retries": int(data.get("retries", os.environ.get("COUNCIL_RETRIES", "2"))),
+        "retry_backoff": float(
+            data.get("retry_backoff", os.environ.get("COUNCIL_RETRY_BACKOFF", "1"))),
+    }
+
+
+def _member_from_env(member_id: str, defaults: dict, fallback: dict) -> Member:
     p = _prefix(member_id)
     temp = os.environ.get(f"{p}_TEMPERATURE", "").strip()
     return Member(
@@ -179,18 +206,21 @@ def _member_from_env(member_id: str, defaults: dict, default_timeout: float) -> 
         max_tokens=int(os.environ.get(f"{p}_MAX_TOKENS", "8192")),
         temperature=float(temp) if temp else None,
         headers=_env_json(f"{p}_HEADERS"),
-        timeout=float(os.environ.get(f"{p}_TIMEOUT", str(default_timeout))),
+        timeout=float(os.environ.get(f"{p}_TIMEOUT", str(fallback["timeout"]))),
+        retries=int(os.environ.get(f"{p}_RETRIES", str(fallback["retries"]))),
+        retry_backoff=float(
+            os.environ.get(f"{p}_RETRY_BACKOFF", str(fallback["retry_backoff"]))),
         proxy=_env_proxy(p),
         enabled=os.environ.get(f"{p}_ENABLED", "1").lower() not in ("0", "false", "no"),
     )
 
 
 def _from_env() -> Council:
-    default_timeout = float(os.environ.get("COUNCIL_TIMEOUT", "180"))
+    fallback = _defaults()
     listed = [s.strip() for s in os.environ.get("COUNCIL_MODELS", "").split(",") if s.strip()]
     ids = listed or list(LEGACY_DEFAULTS)
     members = {
-        i: _member_from_env(i, LEGACY_DEFAULTS.get(i, {}) if not listed else {}, default_timeout)
+        i: _member_from_env(i, LEGACY_DEFAULTS.get(i, {}) if not listed else {}, fallback)
         for i in ids
     }
     source = ("environment (COUNCIL_MODELS)" if listed
@@ -220,7 +250,7 @@ def _uncommented(raw: dict) -> dict:
 def _from_file(path: Path) -> Council:
     warnings: list[str] = []
     data = _expand(json.loads(path.read_text(encoding="utf-8")))
-    default_timeout = float(data.get("timeout", os.environ.get("COUNCIL_TIMEOUT", "180")))
+    fallback = _defaults(data)
 
     providers: dict[str, dict] = {}
     for name, raw in (data.get("providers") or {}).items():
@@ -262,7 +292,8 @@ def _from_file(path: Path) -> Council:
             base["disabled_reason"] = "mixes a provider's connection with its own"
         else:
             base = dict(providers.get(provider_name, {})) if provider_name else {}
-            base.setdefault("timeout", default_timeout)
+            for k, v in fallback.items():
+                base.setdefault(k, v)
             base.update({k: v for k, v in raw.items() if k in _MEMBER_FIELDS})
 
         if member_id in members:

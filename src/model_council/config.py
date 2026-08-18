@@ -138,6 +138,12 @@ class Member:
     # calls. Never set from configuration — guests arrive per request, and are
     # gone when it ends.
     guest: bool = False
+    # Whether this seat will answer again in the next round. Members always do.
+    # A guest passed to `ask_all` cannot — there is nobody to ask — but one the
+    # caller re-runs itself between `revise` calls does, and the two must not be
+    # described to the other members the same way: telling them a voice is
+    # finished when it is about to answer back misrepresents the discussion.
+    revises: bool = True
 
     def __post_init__(self) -> None:
         self.label = self.label or self.id

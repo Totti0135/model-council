@@ -91,8 +91,11 @@ def _seat_guests(guests: list[Guest] | None) -> list[Answer]:
         if not text:
             continue                 # an empty chair is not a participant
         label = (g.label or "").strip() or "Guest"
+        # revises=False: `ask_all` runs its own rounds, and nothing here can go
+        # back and ask a guest for a second answer. Use `revise` if you want a
+        # voice that keeps up with the members.
         seated.append(Answer(Member(id=f"guest:{label}", label=label,
-                                    weight=g.weight, guest=True),
+                                    weight=g.weight, guest=True, revises=False),
                              text, ok=True))
     return seated
 
@@ -179,8 +182,8 @@ def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int
     for a in answers:
         if not a.ok or a.member.id == me.id:
             continue
-        origin = (f"ANSWER FROM {a.member.label} (does not revise between rounds)"
-                  if a.member.guest else f"ROUND-{done} ANSWER FROM {a.member.label}")
+        origin = (f"ROUND-{done} ANSWER FROM {a.member.label}" if a.member.revises
+                  else f"ANSWER FROM {a.member.label} (does not revise between rounds)")
         blocks.append(f"--- {origin} ---\n{a.text}")
     blocks.append(
         "Now give your final answer to the question above. Weigh the other answers on "
@@ -300,6 +303,113 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
     if weighted:
         out += f"\n\n{_weight_note(everyone)}"
     return out + (f"\n\n{_unknown(unknown)}" if unknown else "")
+
+
+class PriorAnswer(BaseModel):
+    """One answer from the round that just finished, on its way into the next."""
+
+    text: str = Field(description="The answer, verbatim.")
+    model: str | None = Field(
+        default=None,
+        description="The member id this answer came from, when it came from one. "
+                    "That member is shown this back as its own answer, which is "
+                    "what lets it revise rather than start over. Leave unset for "
+                    "an answer from outside the roster — your subagent, or your "
+                    "own — and give `label` instead.")
+    label: str | None = Field(
+        default=None,
+        description="Name for an answer from outside the roster, e.g. 'Subagent'. "
+                    "Ignored when `model` is set.")
+    weight: float = Field(
+        default=1.0,
+        description="How far an outside answer carries, on the same scale as the "
+                    "members' weights. Ignored when `model` is set — a member's "
+                    "weight comes from the council's configuration.")
+
+
+def _prior(answers: list[PriorAnswer]) -> tuple[list[Answer], list[str]]:
+    """Rebuild a finished round from what the caller kept.
+
+    An entry naming a member is restored as that member, identity and all, so
+    the revision prompt can hand it back as its own answer. Everything else
+    becomes an outside voice.
+    """
+    table: list[Answer] = []
+    unknown: list[str] = []
+    for a in answers:
+        text = (a.text or "").strip()
+        if not text:
+            continue                       # an empty answer is not a position
+        member = COUNCIL.get(a.model) if a.model else None
+        if a.model and member is None:
+            unknown.append(a.model)
+        if member is None:
+            label = (a.label or "").strip() or (a.model or "").strip() or "Guest"
+            member = Member(id=f"guest:{label}", label=label, weight=a.weight,
+                            guest=True)
+        table.append(Answer(member, text, ok=True))
+    return table, unknown
+
+
+@mcp.tool(description="""Run ONE more round of an existing discussion: show every
+member what was said last round and ask it to revise.
+
+This is `ask_all`'s rounds turned inside out, so that you can drive them. Use it
+when a voice in the discussion is one only you can produce — a subagent you
+spawned, or your own answer — and you want it to be a full member rather than a
+one-off: something that answers, reads the others, and revises alongside them.
+
+The loop:
+
+  1. `ask_all(prompt)`               — the members answer round 1
+     ...and you produce your subagent's round-1 answer yourself
+  2. `revise(prompt, answers=[...])` — pass EVERY round-1 answer, the members'
+     and your subagent's; the members come back revised
+     ...and you re-run your subagent on the same material
+  3. repeat as long as it is still moving
+
+Each entry in `answers` is `{text, model}` for a member's own answer, or
+`{text, label}` for an outside one. Naming the member matters: that is what lets
+it see its previous answer as its own and revise, instead of answering fresh.
+
+`round` is which round the answers you are passing came from, so the members are
+told where they are. Pass answers verbatim, never summarised.""")
+async def revise(prompt: str, answers: list[PriorAnswer],
+                 models: list[ModelId] | None = None,  # type: ignore[valid-type]
+                 system: str | None = None, round: int = 1) -> str:
+    members, unknown_ids = COUNCIL.resolve(models)
+    if not members:
+        return _unknown(unknown_ids) if unknown_ids else "[no council members are configured]"
+
+    table, unknown_prior = _prior(answers)
+    if len(table) < 2:
+        return (f"[a revision round needs at least two answers to put in front of each "
+                f"other, and {len(table)} was supplied. Pass every answer from the "
+                f"previous round — each member's and your own — not just the ones you "
+                f"want critiqued.]")
+
+    done = max(1, round)
+    revised = await asyncio.gather(
+        *(ask_member(m, _revision_prompt(prompt, table, m, done), system)
+          for m in members))
+
+    everyone = members + [a.member for a in table if a.member.guest]
+    weighted = len({m.weight for m in everyone}) > 1
+    seen = ", ".join(a.member.label for a in table)
+    out = [f"########## ROUND {done + 1} — revised after reading round {done} "
+           f"##########",
+           f"[at the table: {seen}]",
+           "",
+           "\n\n".join(_labelled(a, weighted) for a in revised)]
+    body = "\n".join(out)
+    if weighted:
+        body += f"\n\n{_weight_note(everyone)}"
+    if unknown_prior:
+        body += (f"\n\n[these ids are not on this council: {', '.join(unknown_prior)}. "
+                 f"Their answers were carried in as outside voices, which means those "
+                 f"members were not shown their own previous answer. Available: "
+                 f"{_roster()}.]")
+    return body + (f"\n\n{_unknown(unknown_ids)}" if unknown_ids else "")
 
 
 @mcp.tool()

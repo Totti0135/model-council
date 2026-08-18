@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.7.0
+
+**`revise` runs one round on demand, so a voice you produce can be a full
+member.** 0.6.0's `guests` seats an answer you already have, but it speaks once:
+`ask_all` owns its own rounds and has nobody to go back and ask for a second
+answer. A subagent that answers, reads the others, revises, and does it again is
+a different thing, and it needs the rounds turned inside out — this server cannot
+spawn your subagent, so only you can drive the loop.
+
+```
+ask_all(prompt)                                → members answer round 1
+  ...you produce your subagent's round-1 answer
+revise(prompt, round=1, answers=[...everyone's round-1 answers...])
+  ...you re-run your subagent on the same material, and repeat
+```
+
+Each entry is `{text, model}` for a member's own answer or `{text, label}` for a
+voice from outside. Naming the member is what makes it a revision: it gets its
+own previous answer back as its own and moves from there instead of starting
+over. Unbounded, unlike `ask_all`'s three-round ceiling — that limit exists
+because `ask_all` spends its own budget, and here every round is one you chose.
+
+**The members cannot tell an outsider from a member**, which is the point. A
+`revise` outsider is presented exactly as a member is, because it will answer
+again next round; an `ask_all` guest is still flagged as finished, because it
+will not. `Member` gained a `revises` flag to hold that distinction, since
+announcing a voice as done when it is about to speak again misrepresents the
+discussion to the models doing the arguing.
+
 ## 0.6.0
 
 **`ask_all` can seat an answer you already have: `guests`.** The chair is not

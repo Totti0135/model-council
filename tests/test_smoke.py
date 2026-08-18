@@ -546,6 +546,91 @@ async def test_guests_join_the_argument() -> None:
     print("ok  guests (seated, shown to the members verbatim, and argued with)")
 
 
+async def test_revise_drives_a_round_from_outside() -> None:
+    """One round, driven by the caller, so a voice only it can produce keeps up.
+
+    The distinction being tested is the whole feature: a `revise` outsider is
+    presented to the members exactly as another member is, because it *will*
+    answer again — while an `ask_all` guest is flagged as finished, because it
+    will not. Getting that backwards misrepresents the discussion to the models.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str, label: str, **kw) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=label, **kw)
+
+    calls: list[tuple[str, str]] = []
+
+    async def answering(m, prompt, system=None):
+        calls.append((m.id, prompt))
+        return Answer(m, f"{m.label} revised", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha"), "b": member("b", "Beta")}, "t")
+
+        out = await s.revise(
+            prompt="Any traps?",
+            answers=[s.PriorAnswer(model="a", text="Alpha said indexes degrade"),
+                     s.PriorAnswer(model="b", text="Beta said writes race"),
+                     s.PriorAnswer(label="Subagent", text="Subagent said no rollback")],
+            round=1)
+
+        seen = dict(calls)
+        assert len(calls) == 2, calls
+        # A named member gets its own answer back as its own — that is what makes
+        # this a revision rather than the same question asked twice.
+        assert "YOUR OWN ROUND-1 ANSWER" in seen["a"] and "indexes degrade" in seen["a"]
+        assert "Beta said writes race" in seen["a"]
+        # And the outsider is just another member as far as the models can tell.
+        assert "ROUND-1 ANSWER FROM Subagent" in seen["a"], seen["a"]
+        assert "does not revise" not in seen["a"], \
+            "the subagent was announced as finished, but it answers again next round"
+        assert "Alpha revised" in out and "Beta revised" in out
+        assert "ROUND 2" in out and "at the table: Alpha, Beta, Subagent" in out, out
+
+        # An `ask_all` guest is the opposite case, and must stay that way.
+        calls.clear()
+        await s.ask_all("Any traps?", rounds=2,
+                        guests=[s.Guest(label="Oneshot", text="a single remark")])
+        assert "does not revise between rounds" in dict(calls[2:])["a"], \
+            "a guest that cannot answer again was presented as though it would"
+
+        # Round numbers follow the caller's loop.
+        calls.clear()
+        third = await s.revise(prompt="q", round=2, answers=[
+            s.PriorAnswer(model="a", text="x"), s.PriorAnswer(label="Sub", text="y")])
+        assert "ROUND 3" in third and "you are now in round 3" in dict(calls)["a"]
+
+        # Half a table is not a discussion, and silence about it would be worse.
+        thin = await s.revise(prompt="q", answers=[s.PriorAnswer(model="a", text="x")])
+        assert "at least two answers" in thin, thin
+
+        # A stale or mistyped id still contributes its text, but the member it
+        # named never sees it as its own — say so rather than quietly dropping it.
+        calls.clear()
+        typo = await s.revise(prompt="q", answers=[
+            s.PriorAnswer(model="a", text="x"),
+            s.PriorAnswer(model="nope", text="orphaned text"),
+            s.PriorAnswer(model="b", text="z")])
+        assert "not on this council: nope" in typo, typo
+        assert "orphaned text" in dict(calls)["a"], "the answer was silently dropped"
+
+        # Outside voices are weighed on the members' scale.
+        calls.clear()
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha", weight=2)}, "t")
+        ranked = await s.revise(prompt="q", answers=[
+            s.PriorAnswer(model="a", text="x"),
+            s.PriorAnswer(label="Sub", text="y", weight=0.5)])
+        assert "[WEIGHTS — Alpha 2, Sub 0.5]" in ranked, ranked
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  revise (caller-driven round; an outside voice reads as a full member)")
+
+
 def test_registry_metadata_agrees() -> None:
     """server.json must name the same server the README claims ownership of,
     and every file that records a version must record the same one.
@@ -658,7 +743,7 @@ async def test_tools() -> None:
     from model_council import server as s
 
     names = sorted(t.name for t in await s.mcp.list_tools())
-    assert names == ["ask", "ask_all", "list_council", "probe_models"], names
+    assert names == ["ask", "ask_all", "list_council", "probe_models", "revise"], names
 
     # The roster is a schema constraint, not a suggestion in the prose: a wrong
     # id is rejected by validation before any tool body runs.
@@ -807,6 +892,7 @@ def main() -> None:
     asyncio.run(test_rounds_carry_the_previous_answers())
     asyncio.run(test_weights_reach_the_reader_not_the_members())
     asyncio.run(test_guests_join_the_argument())
+    asyncio.run(test_revise_drives_a_round_from_outside())
     asyncio.run(test_tools())
 
 

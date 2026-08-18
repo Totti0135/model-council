@@ -19,6 +19,7 @@ self-run gateway, a local server, or several of each.
 |------|--------------|
 | `ask(model, prompt)` | Ask one member by id |
 | `ask_all(prompt, models?, rounds?, guests?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have |
+| `revise(prompt, answers, round?)` | Run one more round yourself: show the members everything said last round — including answers only you can produce — and get them back revised |
 | `list_council()` | The roster: ids, endpoints, weights, call budget, and whether each member is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
@@ -82,6 +83,46 @@ Notes worth having:
   second round — your subagent against one model is still a discussion.
 - **`weight` works on guests too**, on the same scale as the members'.
 - Guests are per call. Nothing is configured, and nothing persists.
+
+### A subagent as a full member
+
+A guest speaks once. To let a voice you produce yourself *keep up* with the
+members — answer, read the others, revise, round after round, exactly as they do
+— you have to drive the rounds, because this server cannot spawn your subagent.
+`revise` runs one round on demand:
+
+```
+ask_all(prompt)                                  → members answer round 1
+  ...you spawn your subagent on the same prompt   → its round-1 answer
+
+revise(prompt, round=1, answers=[
+  {"model": "glm", "text": "<glm's round-1 answer>"},
+  {"model": "sol", "text": "<sol's round-1 answer>"},
+  {"label": "Subagent", "text": "<subagent's round-1 answer>"},
+])                                               → members come back revised
+  ...you re-run your subagent on the same material
+
+revise(prompt, round=2, answers=[...round 2...]) → and so on
+```
+
+Naming the member with `model` is what makes it a revision: that member is handed
+its own previous answer back as its own, and asked to move from it rather than
+answer fresh. An entry with `label` instead is a voice from outside the roster.
+
+**The members cannot tell the difference.** An outsider passed to `revise` is
+presented exactly as another member is — `--- ROUND-1 ANSWER FROM Subagent ---` —
+because it will answer again next round, and it is the same reason an `ask_all`
+guest *is* flagged as finished. Describing a voice as done when it is about to
+speak again misrepresents the discussion to the models doing the arguing.
+
+`revise` is unbounded — the 3-round ceiling on `ask_all` exists because that call
+spends its own budget, while here every round is one you chose to pay for.
+
+| | `ask_all(guests=…)` | `revise(answers=…)` |
+|---|---|---|
+| Calls | one | one per round |
+| Your voice | speaks once | revises every round |
+| Rounds driven by | the server | you |
 
 ### Retries
 

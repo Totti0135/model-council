@@ -12,6 +12,7 @@
 |------|------|
 | `ask(model, prompt)` | 按 id 问其中一个成员 |
 | `ask_all(prompt, models?, rounds?, guests?)` | 并行问全体（或指定的几个），回答并排返回。`rounds=2` 让它变成一场讨论；`guests` 把你手上已有的回答请进来 |
+| `revise(prompt, answers, round?)` | 你自己推进一轮：把上一轮所有人说的话（包括只有你能产出的那些）摆给成员看，拿回它们修订后的回答 |
 | `list_council()` | 花名册：id、端点、权重、调用预算、每个成员是否就绪。不发网络请求 |
 | `probe_models(model?)` | 打某个端点的 `/models` 路由，看它到底提供哪些模型 id |
 
@@ -53,6 +54,36 @@ ask_all(
 - **guest 也算一个声音。** 一个成员 + 一个 guest 就够开第 2 轮了——你的 subagent 对一个模型，也是一场讨论。
 - **`weight` 对 guest 同样有效**，和成员在同一把尺子上。
 - guest 是**逐次调用**的，不写进配置，也不留存。
+
+### 让 subagent 成为正式一员
+
+guest 只说一次。要让一个由你产出的声音**跟上**成员的节奏——作答、读别人的、修订，一轮接一轮，和它们完全一样——就必须由你来推进轮次，因为这个服务器起不了你的 subagent。`revise` 按需跑一轮：
+
+```
+ask_all(prompt)                                  → 成员给出第 1 轮回答
+  ……你用同一个 prompt 起 subagent                  → 它的第 1 轮回答
+
+revise(prompt, round=1, answers=[
+  {"model": "glm", "text": "<glm 第 1 轮的回答>"},
+  {"model": "sol", "text": "<sol 第 1 轮的回答>"},
+  {"label": "Subagent", "text": "<subagent 第 1 轮的回答>"},
+])                                               → 成员带着修订回来
+  ……你拿同样的材料把 subagent 再跑一遍
+
+revise(prompt, round=2, answers=[……第 2 轮……])    → 以此类推
+```
+
+用 `model` 点名成员，正是"修订"成立的关键：那个成员会拿回**它自己**上一轮的回答，被要求在此基础上移动，而不是从头重答。写 `label` 的条目则是花名册之外的声音。
+
+**成员分辨不出区别。** 传给 `revise` 的外部声音，呈现方式和另一个成员完全一样——`--- ROUND-1 ANSWER FROM Subagent ---`——因为它下一轮还会作答；而 `ask_all` 的 guest **会**被标注为已结束，也是同一个道理。把一个马上还要开口的声音描述成已经说完了，是在向正在辩论的模型谎报现场。
+
+`revise` 不设轮数上限——`ask_all` 那个 3 轮的天花板是因为它自己花预算，而这里每一轮都是你主动付的。
+
+| | `ask_all(guests=…)` | `revise(answers=…)` |
+|---|---|---|
+| 调用次数 | 一次 | 每轮一次 |
+| 你的声音 | 只说一次 | 每轮都修订 |
+| 谁推进轮次 | 服务器 | 你 |
 
 ### 失败重试
 

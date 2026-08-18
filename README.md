@@ -20,6 +20,7 @@ self-run gateway, a local server, or several of each.
 | `ask(model, prompt)` | Ask one member by id |
 | `ask_all(prompt, models?, rounds?, guests?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have |
 | `revise(prompt, answers, round?)` | Run one more round yourself: show the members everything said last round — including answers only you can produce — and get them back revised |
+| `revision_prompt(prompt, answers, seat)` | The prompt to hand your own seat for the next round, word-for-word what the members got. No network calls |
 | `list_council()` | The roster: ids, endpoints, weights, call budget, and whether each member is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
@@ -114,6 +115,24 @@ presented exactly as another member is — `--- ROUND-1 ANSWER FROM Subagent ---
 because it will answer again next round, and it is the same reason an `ask_all`
 guest *is* flagged as finished. Describing a voice as done when it is about to
 speak again misrepresents the discussion to the models doing the arguing.
+
+**Prompt your subagent with `revision_prompt`, not with the original question.**
+This is the one way to get the loop wrong, and it fails silently: a subagent
+handed the question again simply reproduces its previous answer, the transcript
+still looks like a discussion, and nothing marks the round where that seat
+stopped taking part.
+
+```
+revision_prompt(prompt, answers=[...same as revise...], seat="Subagent", round=1)
+```
+
+It returns exactly what the members were given — its own previous answer marked
+as its own, everyone else's, and the same closing instruction, including the line
+telling it not to abandon a position it still believes just because it is
+outnumbered. That sentence is most of what keeps a council from collapsing into
+agreement, and a seat prompted without it is not being asked the same question as
+the others. The call is local and makes no network requests, so run it alongside
+`revise` rather than after it.
 
 `revise` is unbounded — the 3-round ceiling on `ask_all` exists because that call
 spends its own budget, while here every round is one you chose to pay for.

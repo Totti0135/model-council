@@ -402,6 +402,20 @@ async def revise(prompt: str, answers: list[PriorAnswer],
            "",
            "\n\n".join(_labelled(a, weighted) for a in revised)]
     body = "\n".join(out)
+
+    # The seats this server cannot ask. Said in the output and not only in the
+    # docs, because the failure is silent: a subagent re-run on the original
+    # question repeats itself, the transcript looks like a discussion, and
+    # nothing marks the round where that seat stopped taking part.
+    outsiders = [a.member.label for a in table if a.member.guest]
+    if outsiders:
+        who = ", ".join(outsiders)
+        body += (f"\n\n[{who} did not answer above — that seat is yours to re-run, and "
+                 f"this round is not finished until you do. Give it the prompt from "
+                 f"`revision_prompt(seat=\"{outsiders[0]}\", ...)`, which is what the "
+                 f"members were given; the original question alone will only get you "
+                 f"its previous answer again.]")
+
     if weighted:
         body += f"\n\n{_weight_note(everyone)}"
     if unknown_prior:
@@ -410,6 +424,40 @@ async def revise(prompt: str, answers: list[PriorAnswer],
                  f"members were not shown their own previous answer. Available: "
                  f"{_roster()}.]")
     return body + (f"\n\n{_unknown(unknown_ids)}" if unknown_ids else "")
+
+
+@mcp.tool(description="""Build the exact prompt a seat should be given for the next
+round — for the one seat this server cannot ask itself: yours.
+
+`revise` asks the members. Your subagent is yours to re-run, and how you prompt it
+decides whether it revises at all: handed the original question again, it will
+reproduce its previous answer, and nothing in the transcript will show that the
+seat stopped participating. Handed this, it revises on exactly the terms the
+members did — same framing, same instruction to hold a position it still believes
+against the majority, which is the sentence that keeps a council from collapsing
+into agreement.
+
+Pass the same `prompt`, `answers` and `round` you are passing to `revise`, plus
+`seat`: the label (or member id) of the seat to write for. Cheap and local —
+makes no network calls, so run it alongside `revise` rather than after it.""")
+async def revision_prompt(prompt: str, answers: list[PriorAnswer], seat: str,
+                          round: int = 1) -> str:
+    table, _ = _prior(answers)
+    if not table:
+        return "[no previous answers were supplied, so there is nothing to revise from]"
+
+    key = (seat or "").strip().lower()
+    if not key:
+        return "[name the seat to write for, e.g. seat='Subagent']"
+
+    me = next((a.member for a in table
+               if a.member.id.lower() == key or a.member.label.lower() == key), None)
+    if me is None:
+        # A seat that sat out the last round still gets to join this one; the
+        # prompt tells it so rather than pretending it had said something.
+        me = Member(id=f"guest:{seat}", label=seat.strip(), guest=True)
+
+    return _revision_prompt(prompt, table, me, max(1, round))
 
 
 @mcp.tool()

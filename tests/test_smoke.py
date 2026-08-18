@@ -631,6 +631,67 @@ async def test_revise_drives_a_round_from_outside() -> None:
     print("ok  revise (caller-driven round; an outside voice reads as a full member)")
 
 
+async def test_revision_prompt_writes_for_the_seat_we_cannot_ask() -> None:
+    """The caller's own seat gets word-for-word what the members got.
+
+    Without this the caller improvises, and the likeliest improvisation — hand
+    the subagent the original question again — reproduces its previous answer
+    while the transcript still reads like a discussion. The failure is silent,
+    so both halves are tested: the prompt itself, and the warning that says so.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str, label: str) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=label)
+
+    async def answering(m, prompt, system=None):
+        return Answer(m, f"{m.label} revised", ok=True)
+
+    prior = [s.PriorAnswer(model="a", text="Alpha said indexes degrade"),
+             s.PriorAnswer(model="b", text="Beta said writes race"),
+             s.PriorAnswer(label="Subagent", text="Subagent said no rollback")]
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha"), "b": member("b", "Beta")}, "t")
+
+        mine = await s.revision_prompt(prompt="Any traps?", answers=prior,
+                                       seat="Subagent", round=1)
+        assert "YOUR OWN ROUND-1 ANSWER" in mine and "no rollback" in mine, mine
+        assert "Alpha said indexes degrade" in mine and "Beta said writes race" in mine
+        # The sentence that keeps the seat from folding — the members get it, so
+        # the subagent must too, or the two are not being asked the same thing.
+        assert "just because you are outnumbered" in mine, mine
+        # Its own answer appears once, as its own, not also as somebody else's.
+        assert mine.count("no rollback") == 1, mine
+
+        # A member id addresses the same seat as its label does.
+        by_id = await s.revision_prompt(prompt="Any traps?", answers=prior, seat="a")
+        by_label = await s.revision_prompt(prompt="Any traps?", answers=prior, seat="Alpha")
+        assert by_id == by_label and "YOUR OWN ROUND-1 ANSWER" in by_id
+        assert "indexes degrade" in by_id
+
+        # A seat that sat the round out is told so, not handed someone else's words.
+        newcomer = await s.revision_prompt(prompt="Any traps?", answers=prior, seat="Latecomer")
+        assert "(you did not answer)" in newcomer, newcomer
+        assert "no rollback" in newcomer, "it still needs to see what was said"
+
+        blank = await s.revision_prompt(prompt="q", answers=[], seat="Subagent")
+        assert "nothing to revise from" in blank, blank
+
+        # And `revise` itself says the round is not finished, in its own output.
+        out = await s.revise(prompt="Any traps?", answers=prior, round=1)
+        assert "Subagent did not answer above" in out, out
+        assert 'revision_prompt(seat="Subagent"' in out, out
+        assert "previous answer again" in out, out
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  revision_prompt (the caller's seat is asked on the members' terms)")
+
+
 def test_registry_metadata_agrees() -> None:
     """server.json must name the same server the README claims ownership of,
     and every file that records a version must record the same one.
@@ -743,7 +804,8 @@ async def test_tools() -> None:
     from model_council import server as s
 
     names = sorted(t.name for t in await s.mcp.list_tools())
-    assert names == ["ask", "ask_all", "list_council", "probe_models", "revise"], names
+    assert names == ["ask", "ask_all", "list_council", "probe_models", "revise",
+                     "revision_prompt"], names
 
     # The roster is a schema constraint, not a suggestion in the prose: a wrong
     # id is rejected by validation before any tool body runs.
@@ -893,6 +955,7 @@ def main() -> None:
     asyncio.run(test_weights_reach_the_reader_not_the_members())
     asyncio.run(test_guests_join_the_argument())
     asyncio.run(test_revise_drives_a_round_from_outside())
+    asyncio.run(test_revision_prompt_writes_for_the_seat_we_cannot_ask())
     asyncio.run(test_tools())
 
 

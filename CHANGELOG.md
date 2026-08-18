@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0
+
+**`revision_prompt` writes the prompt for the one seat this server cannot ask.**
+0.7.0 let a subagent revise alongside the members, but left the caller to work
+out how to prompt it — and the likeliest guess, handing it the original question
+again, does not revise anything. It reproduces the previous answer, the
+transcript still reads as a discussion, and nothing marks the round where that
+seat stopped taking part. The failure had no symptom, which made it the wrong
+thing to leave to inference.
+
+```
+revision_prompt(prompt, answers=[...same as revise...], seat="Subagent", round=1)
+```
+
+It returns exactly what the members were given: the seat's own previous answer
+marked as its own, everyone else's verbatim, and the same closing instruction —
+including the line telling it not to abandon a position it still believes just
+because it is outnumbered. That sentence is most of what stops a council
+collapsing into agreement, and a seat prompted without it is not being asked the
+same question as the rest. Local and free of network calls, like `list_council`,
+so it runs alongside `revise` rather than after it.
+
+`revise` now also names the seats it could not ask, in its own output, and says
+the round is unfinished until the caller answers for them. Documentation is the
+wrong and only place for a warning about a silent failure.
+
 ## 0.7.0
 
 **`revise` runs one round on demand, so a voice you produce can be a full

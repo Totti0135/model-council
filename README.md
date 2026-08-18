@@ -17,16 +17,82 @@ self-run gateway, a local server, or several of each.
 
 | Tool | What it does |
 |------|--------------|
-| `ask(model, prompt)` | Ask one member by id |
-| `ask_all(prompt, models?, rounds?, guests?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have |
-| `revise(prompt, answers, round?)` | Run one more round yourself: show the members everything said last round — including answers only you can produce — and get them back revised |
-| `revision_prompt(prompt, answers, seat)` | The prompt to hand your own seat for the next round, word-for-word what the members got. No network calls |
-| `list_council()` | The roster: ids, endpoints, weights, call budget, and whether each member is ready. No network calls |
+| `ask(model, prompt, materials?)` | Ask one member by id |
+| `ask_all(prompt, models?, rounds?, guests?, materials?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have; `materials` hands them a file to read |
+| `revise(prompt, answers, round?, materials?)` | Run one more round yourself: show the members everything said last round — including answers only you can produce — and get them back revised |
+| `revision_prompt(prompt, answers, seat, materials?)` | The prompt to hand your own seat for the next round, word-for-word what the members got. No network calls |
+| `list_council()` | The roster: ids, endpoints, weights, what each member can be shown, call budget, and whether it is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
 Members are stateless and cannot see your conversation, so the chair passes
 everything they need in each call. That is exactly what makes cross-review work:
 it puts one member's answer inside another's `prompt`.
+
+### Giving the council something to read
+
+A question is usually about something — a spec, a log, a diff, a screenshot. The
+obvious way to include it is to paste it into `prompt`, and that is the expensive
+one, in the place nobody watches: `prompt` is an argument the chair *writes*, so
+a long document costs a full copy of itself in generated tokens on every call,
+and what reaches the members is whatever the chair managed to reproduce. For
+forty pages that is not reliably the document. A council reviewing a paraphrase
+is not reviewing the thing, and nothing in the transcript would say so.
+
+`materials` names it instead:
+
+```
+ask_all(
+  prompt="Where would this break under load?",
+  materials=[
+    {"label": "The design", "path": "/abs/path/design.md"},
+    {"label": "Latency graph", "path": "/abs/path/p99.png"},
+    {"label": "My summary", "text": "…something with no file behind it…"},
+  ],
+  rounds=2,
+)
+```
+
+The server reads each one and puts it ahead of the question, in the same place
+for every member and every round. The position is not presentation:
+
+- **Identical bytes.** Every member argues with the same copy, which is what
+  makes their disagreement about the document rather than about which version
+  each was given.
+- **A prefix that can be cached.** Everything up to the end of the material is
+  the same in every call of a discussion. The Anthropic format is told so
+  explicitly, with one `cache_control` breakpoint at that boundary; endpoints
+  that cache by prefix on their own get the shape they need either way. Set
+  `"cache": false` on a member whose gateway rejects the field.
+- **The chair pays once.** A path costs the chair a line, not a copy of the
+  document, and `ask_all` carries the material into round 2 and 3 by itself.
+
+**Images are the case that matters most.** Without them the chair has to describe
+the screenshot in prose — and then every member reads the *same* description, so
+anything the chair misread is misread by the whole council at once, and
+cross-review cannot recover it. It is the one input where passing it badly
+quietly removes the independence the council is for. Png, jpeg, gif and webp go
+to every member whose model can see; a member that cannot should be configured
+`"vision": false`, and it then sits out the calls that carry an image rather than
+answering about text alone as though it had seen the picture. The transcript
+names who sat out.
+
+**How to tell which members those are:** a member that cannot see rarely says so.
+One Anthropic-compatible gateway tested while building this accepted the image
+blocks, discarded them, and the model then named a colour — not "I was sent no
+image", which the prompt had explicitly asked for in that case. Text material
+through the same endpoint arrived intact, so nothing about the call looked wrong.
+Show a member one unambiguous picture and ask what is in it; a confidently wrong
+answer is the symptom, and `"vision": false` is the fix.
+
+Two limits worth knowing. A material that cannot be read **stops the call** — a
+council asked about a document it never received will answer anyway, fluently,
+and read exactly like one that had. And `revision_prompt` *names* your files
+rather than pasting them back, at the position the members were given them, so
+open them for your own seat before you hand it the rest.
+
+Whether this server will read a path at all depends on how it was started; over
+HTTP it will not, unless its operator [named a directory](#material-over-http).
+`list_council` says which, in a line above the table.
 
 ### Rounds
 
@@ -42,6 +108,17 @@ nothing between calls, so without it a second round is just the same question
 asked twice. Up to 3 rounds; each one costs another call per member and a longer
 prompt than the last, so 1 is right for a survey of opinion and 2 for a question
 where the disagreement is the interesting part.
+
+**`rounds` is chosen before anything has been asked**, which is the one thing
+wrong with it: you commit to a second round without having read the first, and a
+council that turns out to agree costs exactly what one still arguing would. Ask
+with `rounds=1` when you would rather look first, then buy the next round with
+[`revise`](#a-subagent-as-a-full-member) — it runs exactly one more, as many
+times as you judge it worth, and has no ceiling of its own. Reading before you
+buy is usually the cheaper side: another round is a full call per member, while
+`revise` costs you only the answers written back into it. The 3 on `ask_all` is a
+ceiling on what one call will spend, not on what the discussion can have, and the
+transcript says so when you reach it.
 
 Members can also carry different [weights](#weights), for the common case where
 the council is not a council of equals.
@@ -288,6 +365,7 @@ always admitted.
 | `--allow` | CIDRs, bare addresses, or the names `private` (RFC1918), `loopback`, `any` |
 | `--trust-proxy` | reverse proxies whose `X-Forwarded-For` may be believed |
 | `--allow-origin` | permit a browser `Origin`; repeatable |
+| `--materials-root` | the one directory `materials` paths may name; without it, HTTP refuses paths |
 
 `--trust-proxy` is the one worth reading twice. Without it `X-Forwarded-For` is
 ignored entirely and the peer address decides — behind nginx that is nginx, so
@@ -303,6 +381,21 @@ apart.
 
 Every flag has an environment variable (`COUNCIL_ALLOW`, `COUNCIL_TRUST_PROXY`,
 `COUNCIL_HTTP_HOST`, …); `--help` lists them.
+
+<a name="material-over-http"></a>
+
+### Material over HTTP
+
+Over stdio, `materials` reads any file the process can, and needs no flag: the
+caller launched this process, so it already had that access — the same reasoning
+that lets a loopback bind skip `--allow`. Over HTTP the reasoning is gone. The
+caller is whoever reached the port, a path would make one shared council into a
+way to read its host's files, and what it read would leave for an external
+provider. So an HTTP deployment **refuses paths outright**, and callers pass the
+contents as `text`.
+
+`--materials-root /srv/council/material` opens exactly one directory, resolved
+before it is compared, so a symlink is judged by where it lands.
 
 ### What this does not do
 
@@ -376,8 +469,9 @@ GLM_FORMAT=anthropic
 
 Per member: `_BASE_URL`, `_API_KEY`, `_MODEL`, `_FORMAT`, `_LABEL`, `_WEIGHT`,
 `_MAX_TOKENS`, `_TEMPERATURE`, `_TIMEOUT`, `_RETRIES`, `_RETRY_BACKOFF`,
-`_HEADERS` (a JSON object), `_PROXY`, `_ENABLED`. Globally: `COUNCIL_TIMEOUT`,
-`COUNCIL_RETRIES`, `COUNCIL_RETRY_BACKOFF`, `COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`.
+`_HEADERS` (a JSON object), `_PROXY`, `_VISION`, `_CACHE`, `_ENABLED`. Globally:
+`COUNCIL_TIMEOUT`, `COUNCIL_RETRIES`, `COUNCIL_RETRY_BACKOFF`, `COUNCIL_CONFIG`,
+`COUNCIL_ENV_FILE`, `COUNCIL_MATERIALS_ROOT`.
 
 Omit `COUNCIL_MODELS` and the roster defaults to `chatgpt,glm`, reading
 `CHATGPT_*` and `GLM_*`.
@@ -446,6 +540,8 @@ The first three travel together as one unit — see the rule above.
 | `retries` | provider, member | Extra attempts a transient failure gets. Default 2, max 5, `0` to disable |
 | `retry_backoff` | provider, member | Seconds before the first retry, doubling from there. Default 1 |
 | `proxy` | provider, member | Omit to follow `HTTP_PROXY`/`HTTPS_PROXY`; `false` to connect directly; a URL to use that proxy |
+| `vision` | member | `false` for a model that cannot be shown an image. It then sits out calls carrying one, rather than answering about the text alone. Default `true` |
+| `cache` | provider, member | `false` stops the `cache_control` breakpoint being sent with material. Anthropic format only; turn it off for a gateway that rejects the field. Default `true` |
 | `enabled` | member | `false` parks a member without deleting its config |
 
 `timeout`, `retries` and `retry_backoff` can also be set at the top level of the

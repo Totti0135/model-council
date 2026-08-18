@@ -49,6 +49,19 @@
     { "id": "glm", "provider": "zhipu", "model": "glm-4.6", "max_tokens": 8192 },
 
     {
+      "$comment": [
+        "'vision': false for a model that cannot be shown an image. It then sits",
+        "out any call carrying one in 'materials', rather than answering about the",
+        "text alone in the same confident register as the members who saw it.",
+        "'cache' is the other half: material is marked as a cacheable prefix on the",
+        "anthropic format, and this turns that off for a gateway that rejects the",
+        "field. It may also be set once on the provider."
+      ],
+      "id": "small", "provider": "my-relay", "model": "text-only-8b",
+      "vision": false, "cache": false
+    },
+
+    {
       "$comment": "a member may skip 'provider' and carry its own connection",
       "id": "kimi",
       "base_url": "https://api.moonshot.cn/v1",

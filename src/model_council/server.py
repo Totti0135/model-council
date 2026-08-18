@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Literal
 
 from mcp.server import MCPServer
@@ -28,6 +29,9 @@ from starlette.responses import JSONResponse, Response
 
 from model_council import __version__
 from model_council.config import Member, load_council
+from model_council.materials import (Loaded, Material, MaterialError, Policy,
+                                     get_policy, render_for_seat, set_policy)
+from model_council.materials import load as load_materials
 from model_council.providers import Answer, ask_member, probe_member
 
 COUNCIL = load_council()
@@ -98,6 +102,49 @@ def _seat_guests(guests: list[Guest] | None) -> list[Answer]:
                                     weight=g.weight, guest=True, revises=False),
                              text, ok=True))
     return seated
+
+
+def _with_eyes(members: list[Member], docs: list[Loaded]) -> tuple[list[Member], list[Member]]:
+    """Split the roster over a call that carries an image.
+
+    A member configured `vision: false` is left out rather than sent the text
+    alone. The alternative looks kinder and is worse: it would answer, in the
+    same confident register as the members who saw the image, about material it
+    was never shown — and that answer then goes into the next round as though it
+    were informed. Sitting the seat out costs one opinion and says so.
+    """
+    if not any(d.is_image for d in docs):
+        return members, []
+    return [m for m in members if m.vision], [m for m in members if not m.vision]
+
+
+def _blind_note(blind: list[Member]) -> str:
+    who = ", ".join(m.label for m in blind)
+    verb = "is" if len(blind) == 1 else "are"
+    return (f"[{who} {verb} configured `vision: false` and sat out this call, which "
+            f"carries an image. Set it true for a member whose model can see.]")
+
+
+def _material_note(docs: list[Loaded], blind: list[Member]) -> str:
+    """What the council was reading, for whoever reads the transcript."""
+    note = (f"[material on the table: {'; '.join(d.describe() for d in docs)}. "
+            f"Every member was handed the same bytes, ahead of the question.]")
+    return f"{note}\n{_blind_note(blind)}" if blind else note
+
+
+def _paths_note() -> str:
+    """Whether `materials` may name a file here — said before a caller tries.
+
+    The answer is a property of how this server was started, which the caller
+    cannot see. Leaving it to be discovered costs a failed call to learn a fact
+    that fits on one line.
+    """
+    policy = get_policy()
+    if not policy.allow_paths:
+        return f"refused ({policy.why or 'this server does not read its own host'}) — pass `text`"
+    if policy.root is not None:
+        return f"allowed under {policy.root}"
+    return "allowed (any file this server can read)"
 
 
 def _origin(m: Member) -> str:
@@ -227,6 +274,21 @@ def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int
     return "\n\n".join(blocks)
 
 
+# The one paragraph four tools need to say the same way. Written for the caller
+# that is a model: it explains the cost of the alternative, because pasting a
+# document into `prompt` is the thing that looks free and is not.
+_MATERIAL_DOC = """`materials` hands the council the thing the question is about — a spec, a log, \
+a diff, a screenshot — instead of you pasting it into `prompt`. Give \
+`{path, label}` for a file, or `{text, label}` for something with no file behind \
+it. Prefer a path: the members are then handed the file's exact bytes rather \
+than your reproduction of them, you do not spend a copy of the whole document \
+writing this call, and every member and every round get an identical copy, which \
+is both what makes their answers comparable and what an endpoint's cache can \
+match. Images go this way too, and are the case that matters most: describe a \
+screenshot in prose and every member inherits the same description, so anything \
+you misread is misread by the whole council at once."""
+
+
 # --------------------------------------------------------------------------- #
 # MCP tools
 #
@@ -242,14 +304,24 @@ def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int
 
 The member is stateless and cannot see this conversation, so `prompt` must carry
 everything it needs — including any other model's answer you want it to critique.
-Optionally set `system` to steer its role or output format.""")
-async def ask(model: ModelId, prompt: str, system: str | None = None) -> str:  # type: ignore[valid-type]
+Optionally set `system` to steer its role or output format.
+
+""" + _MATERIAL_DOC)
+async def ask(model: ModelId, prompt: str, system: str | None = None,  # type: ignore[valid-type]
+              materials: list[Material] | None = None) -> str:
     # The enum normally rejects a bad id before we get here; this covers the
     # unconstrained fallback when no members are configured.
     m = COUNCIL.get(model)
     if m is None:
         return _unknown([model])
-    return (await ask_member(m, prompt, system)).text
+    try:
+        docs = load_materials(materials)
+    except MaterialError as e:
+        return f"[{e}]"
+    seeing, blind = _with_eyes([m], docs)
+    if not seeing:
+        return _blind_note(blind)
+    return (await ask_member(m, prompt, system, docs)).text
 
 
 @mcp.tool(description="""Ask several members the SAME prompt in parallel, returning
@@ -269,6 +341,15 @@ who held their ground.
 One round is a survey of opinion. Two is worth the extra latency and tokens when
 the answers are likely to disagree and the disagreement is the interesting part.
 
+`rounds` is chosen before anything has been asked, which is the one thing wrong
+with it: you commit to a second round without having read the first, and a
+council that turns out to agree costs exactly what one still arguing would. When
+you would rather look first, ask with `rounds=1` and then call `revise` with the
+answers — it runs one more round on demand, as many times as you judge it worth,
+and it has no ceiling. Reading before you buy is usually the cheaper of the two:
+one more round is another full call per member, while `revise` costs you only the
+answers written back into it.
+
 `guests` seats answers you already have. If you spawned a subagent on this same
 question, or formed your own view first, pass it here as {label, text} and it
 joins the table: it appears in round 1 beside the members, and from round 2 the
@@ -283,12 +364,28 @@ transcript says so, and says it is not a retraction.
 Members may carry different weights — how much this council trusts each one. When
 they do, every answer is labeled with its weight and the transcript ends with the
 ranking and how to read it. The members are never told each other's weights; a
-model told it is outranked stops arguing, and its dissent is what you came for.""")
+model told it is outranked stops arguing, and its dissent is what you came for.
+
+""" + _MATERIAL_DOC + """ It is carried into every round for you, so a discussion
+about one document costs you the path once.""")
 async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ignore[valid-type]
                   system: str | None = None, rounds: int = 1,
-                  guests: list[Guest] | None = None) -> str:
+                  guests: list[Guest] | None = None,
+                  materials: list[Material] | None = None) -> str:
     members, unknown = COUNCIL.resolve(models)
     seated = _seat_guests(guests)
+    # Before anything is asked: a council given a question about a document it
+    # never received would answer it anyway, at length, and read as though it
+    # had. That failure has to stop the call, not degrade it.
+    try:
+        docs = load_materials(materials)
+    except MaterialError as e:
+        return f"[{e}]"
+    members, blind = _with_eyes(members, docs)
+    if not members and blind:
+        return (f"[this call carries an image and every member asked for is configured "
+                f"`vision: false`, so there is nobody left to show it to. Set it true "
+                f"for a member whose model can see, or ask without the image.]")
     if not members:
         if unknown:
             return _unknown(unknown)
@@ -304,7 +401,7 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
     weighted = len({m.weight for m in everyone}) > 1
 
     total = max(1, min(rounds, MAX_ROUNDS))
-    answers = await asyncio.gather(*(ask_member(m, prompt, system) for m in members))
+    answers = await asyncio.gather(*(ask_member(m, prompt, system, docs) for m in members))
 
     # `table` is what the next round is shown: this round's member answers plus
     # the guests, who persist unchanged. `answers` alone is what each round's
@@ -320,8 +417,12 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
                     f"answers to put in front of each other, and this round produced "
                     f"{answered}.]")
             break
+        # The material goes again with every round: the members are stateless, so
+        # "the document from last time" does not exist for them. It is the same
+        # bytes in the same position each time, which is the arrangement an
+        # endpoint that caches by prefix can actually reuse.
         answers = await asyncio.gather(
-            *(ask_member(m, _revision_prompt(prompt, table, m, done), system)
+            *(ask_member(m, _revision_prompt(prompt, table, m, done), system, docs)
               for m in members))
         table = list(answers) + seated
         parts.append(_round_block(done + 1, total,
@@ -329,6 +430,18 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
                                   weighted))
 
     out = "\n\n".join(parts) + note
+    # A caller that asked for the maximum and got it has been shown a ceiling,
+    # and the obvious reading of a ceiling is that the discussion has none left.
+    # It is a ceiling on what one call will spend, and the correction belongs
+    # where the impression was made.
+    if len(parts) == MAX_ROUNDS and sum(a.ok for a in table) >= 2:
+        out += (f"\n\n[{MAX_ROUNDS} rounds is the most `ask_all` runs in one call, not the "
+                f"most this discussion can have. `revise(prompt, answers=[the answers "
+                f"above, verbatim], round={MAX_ROUNDS})` runs another, and has no ceiling "
+                f"of its own — the one here exists because this call commits to its "
+                f"rounds before you have read any of them.]")
+    if docs:
+        out = f"{_material_note(docs, blind)}\n\n{out}"
     if len(parts) > 1:
         # Only after a revision round: round 1 is answered blind, so no member
         # has seen another's letter yet and there is no key to explain.
@@ -389,12 +502,20 @@ def _prior(answers: list[PriorAnswer]) -> tuple[list[Answer], list[str]]:
 @mcp.tool(description="""Run ONE more round of an existing discussion: show every
 member what was said last round and ask it to revise.
 
-This is `ask_all`'s rounds turned inside out, so that you can drive them. Use it
-when a voice in the discussion is one only you can produce — a subagent you
+This is `ask_all`'s rounds turned inside out, so that you can drive them. Two
+reasons to want that.
+
+**You would rather decide after reading.** `ask_all(rounds=2)` commits to the
+second round before the first one exists. Ask with `rounds=1`, read what comes
+back, and call this only if the disagreement is worth another call per member —
+or call it three more times if they are still moving. There is no round ceiling
+here, unlike `ask_all`, because every round is one you chose to pay for.
+
+**A voice in the discussion is one only you can produce** — a subagent you
 spawned, or your own answer — and you want it to be a full member rather than a
 one-off: something that answers, reads the others, and revises alongside them.
 
-The loop:
+The loop, in the second case:
 
   1. `ask_all(prompt)`               — the members answer round 1
      ...and you produce your subagent's round-1 answer yourself
@@ -408,11 +529,25 @@ Each entry in `answers` is `{text, model}` for a member's own answer, or
 it see its previous answer as its own and revise, instead of answering fresh.
 
 `round` is which round the answers you are passing came from, so the members are
-told where they are. Pass answers verbatim, never summarised.""")
+told where they are. Pass answers verbatim, never summarised.
+
+Pass the same `materials` you passed to `ask_all`, every round. The members are
+stateless: a document they were shown last round does not exist for them in this
+one, and a council revising from memory it does not have will revise from the
+other answers alone.""")
 async def revise(prompt: str, answers: list[PriorAnswer],
                  models: list[ModelId] | None = None,  # type: ignore[valid-type]
-                 system: str | None = None, round: int = 1) -> str:
+                 system: str | None = None, round: int = 1,
+                 materials: list[Material] | None = None) -> str:
     members, unknown_ids = COUNCIL.resolve(models)
+    try:
+        docs = load_materials(materials)
+    except MaterialError as e:
+        return f"[{e}]"
+    members, blind = _with_eyes(members, docs)
+    if not members and blind:
+        return (f"[this call carries an image and every member asked for is configured "
+                f"`vision: false`, so there is nobody left to show it to.]")
     if not members:
         return _unknown(unknown_ids) if unknown_ids else "[no council members are configured]"
 
@@ -425,7 +560,7 @@ async def revise(prompt: str, answers: list[PriorAnswer],
 
     done = max(1, round)
     revised = await asyncio.gather(
-        *(ask_member(m, _revision_prompt(prompt, table, m, done), system)
+        *(ask_member(m, _revision_prompt(prompt, table, m, done), system, docs)
           for m in members))
 
     everyone = members + [a.member for a in table if a.member.guest]
@@ -436,6 +571,8 @@ async def revise(prompt: str, answers: list[PriorAnswer],
            f"[at the table: {seen}]",
            "",
            "\n\n".join(_labelled(a, weighted) for a in revised)]
+    if docs:
+        out.insert(2, _material_note(docs, blind))
     body = "\n".join(out)
 
     # The seats this server cannot ask. Said in the output and not only in the
@@ -474,14 +611,25 @@ members did — same framing, same instruction to hold a position it still belie
 against the majority, which is the sentence that keeps a council from collapsing
 into agreement.
 
-Pass the same `prompt`, `answers` and `round` you are passing to `revise`, plus
-`seat`: the label (or member id) of the seat to write for. Cheap and local —
-makes no network calls, so run it alongside `revise` rather than after it.""")
+Pass the same `prompt`, `answers`, `round` and `materials` you are passing to
+`revise`, plus `seat`: the label (or member id) of the seat to write for. Cheap
+and local — makes no network calls, so run it alongside `revise` rather than
+after it.
+
+Material is named in the prompt rather than pasted into it, at the position the
+members were given it. Open those files for your seat before you hand it the
+rest: a seat that revises without the document is arguing about something it has
+not read, and the transcript will not show it.""")
 async def revision_prompt(prompt: str, answers: list[PriorAnswer], seat: str,
-                          round: int = 1) -> str:
+                          round: int = 1,
+                          materials: list[Material] | None = None) -> str:
     table, _ = _prior(answers)
     if not table:
         return "[no previous answers were supplied, so there is nothing to revise from]"
+    try:
+        docs = load_materials(materials)
+    except MaterialError as e:
+        return f"[{e}]"
 
     key = (seat or "").strip().lower()
     if not key:
@@ -494,7 +642,9 @@ async def revision_prompt(prompt: str, answers: list[PriorAnswer], seat: str,
         # prompt tells it so rather than pretending it had said something.
         me = Member(id=f"guest:{seat}", label=seat.strip(), guest=True)
 
-    return _revision_prompt(prompt, table, me, max(1, round))
+    written = _revision_prompt(prompt, table, me, max(1, round))
+    material = render_for_seat(docs)
+    return f"{material}\n\n{written}" if material else written
 
 
 @mcp.tool()
@@ -509,21 +659,28 @@ async def list_council() -> str:
     `tries` is how many attempts a call gets and how long each may take, so a
     member that is slow or that keeps being retried is visible here.
 
+    `sees` is whether this member may be shown an image in `materials`. The line
+    above the table says whether this server will read `materials` paths at all,
+    which depends on how its operator runs it.
+
     Cheap and local — makes no network calls. Use this to find out which ids you
     may pass to `ask` and `ask_all`, or to explain a configuration problem.
     """
-    rows = [("id", "label", "model", "weight", "format", "endpoint", "tries", "status")]
+    rows = [("id", "label", "model", "weight", "format", "sees", "endpoint", "tries",
+             "status")]
     for m in COUNCIL.members.values():
         status = "ready" if m.configured else f"missing {', '.join(m.missing)}"
         if not m.enabled:
             status = f"disabled — {m.disabled_reason}" if m.disabled_reason else "disabled"
         rows.append((m.id, m.label, m.model or "-", f"{m.weight:g}", m.format,
+                     "text+img" if m.vision else "text",
                      m.base_url or "-", f"{m.retries + 1} × {m.timeout:g}s", status))
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     table = "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
 
-    out = [f"config source: {COUNCIL.source}", "", table]
+    out = [f"config source: {COUNCIL.source}", f"material paths: {_paths_note()}", "",
+           table]
     if COUNCIL.warnings:
         out += ["", "warnings:"] + [f"  - {w}" for w in COUNCIL.warnings]
     return "\n".join(out)
@@ -601,6 +758,7 @@ examples:
   model-council-mcp --http --host 0.0.0.0 --allow private
   model-council-mcp --http --host 0.0.0.0 --allow 10.20.0.0/16,10.30.1.5
   model-council-mcp --http --allow private --trust-proxy 10.0.0.9
+  model-council-mcp --http --allow private --materials-root /srv/council/material
 """)
     p.add_argument("--http", action="store_true", default=_env_flag("COUNCIL_HTTP"),
                    help="listen over Streamable HTTP instead of stdio [COUNCIL_HTTP]")
@@ -625,8 +783,44 @@ examples:
                    help="permit browser requests from this Origin; repeatable. By "
                         "default any request carrying an Origin is refused "
                         "[COUNCIL_ALLOW_ORIGIN]")
+    p.add_argument("--materials-root", metavar="DIR",
+                   default=os.environ.get("COUNCIL_MATERIALS_ROOT", ""),
+                   help="the one directory `materials` paths may name. Over HTTP "
+                        "this is what allows paths at all — without it a networked "
+                        "deployment refuses them and callers inline the text. Over "
+                        "stdio, paths are already allowed and this narrows them "
+                        "[COUNCIL_MATERIALS_ROOT]")
     p.add_argument("--version", action="version", version=f"model-council {__version__}")
     return p, p.parse_args(argv)
+
+
+def _material_policy(parser: argparse.ArgumentParser,
+                     args: argparse.Namespace) -> Policy:
+    """Whether this process will read a caller's paths, decided once at startup.
+
+    Over stdio, yes and without a flag — the caller launched this process, so it
+    already reads everything this process can, exactly as a loopback bind needs
+    no `--allow`. Over HTTP that reasoning is gone: the caller is whoever reached
+    the port, a path would make this a file-read primitive on its host, and the
+    file's contents would leave for an external provider. So HTTP refuses paths
+    unless the operator names one directory to serve them from.
+    """
+    root = (getattr(args, "materials_root", "") or "").strip()
+    if root:
+        path = Path(root).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except OSError:
+            parser.error(f"--materials-root {path} does not exist")
+        if not path.is_dir():
+            parser.error(f"--materials-root {path} is not a directory")
+        return Policy(allow_paths=True, root=path)
+    if args.http:
+        return Policy(allow_paths=False,
+                      why="it serves over HTTP, where reading a caller's path would "
+                          "make one shared council a way to read this host's files "
+                          "and forward them to a provider")
+    return Policy()
 
 
 def _warn_about_config() -> None:
@@ -677,6 +871,14 @@ def _serve_http(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
     if not trusted:
         log.info("no --trust-proxy set: X-Forwarded-For is ignored and the peer "
                  "address decides. Behind a reverse proxy, that is the proxy.")
+    policy = _material_policy(parser, args)
+    set_policy(policy)
+    if policy.root is not None:
+        log.info("materials: callers may name files under %s, and this process "
+                 "forwards what it reads to a provider", policy.root)
+    else:
+        log.info("materials: paths are refused and callers must inline the text; "
+                 "--materials-root DIR opens one directory")
 
     _warn_about_config()
 
@@ -706,6 +908,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.http:
         _serve_http(parser, args)
         return
+    set_policy(_material_policy(parser, args))
     _warn_about_config()
     mcp.run()
 

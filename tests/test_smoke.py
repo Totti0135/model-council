@@ -11,6 +11,7 @@ finishes with a live round-trip through ask_all.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -276,6 +277,42 @@ def test_weights() -> None:
     print("ok  weights (per member, default 1, clamped, typos fall back to neutral)")
 
 
+async def test_the_ceiling_is_on_the_call_not_the_discussion() -> None:
+    """Hitting MAX_ROUNDS must not read as the discussion having no rounds left."""
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(i: str) -> cfg.Member:
+        return cfg.Member(id=i, model="m", base_url="https://h/v1", api_key="k", label=i)
+
+    async def answering(m, prompt, system=None, docs=None):
+        return Answer(m, f"{m.label} still thinks so", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a"), "b": member("b")}, "test")
+
+        out = await s.ask_all("q", rounds=s.MAX_ROUNDS)
+        assert f"ROUND {s.MAX_ROUNDS} of {s.MAX_ROUNDS}" in out, out
+        assert "not the most this discussion can have" in out, out
+        assert f"round={s.MAX_ROUNDS}" in out, "it should name the next call"
+
+        # Below the ceiling there is no false impression to correct, and a note
+        # on every transcript is noise rather than guidance.
+        assert "not the most this discussion can have" not in await s.ask_all("q")
+
+        # Nor when the round produced nothing to put in front of anyone.
+        async def failing(m, prompt, system=None, docs=None):
+            return Answer(m, "[down]", ok=False)
+        s.ask_member = failing
+        out = await s.ask_all("q", rounds=s.MAX_ROUNDS)
+        assert "not the most this discussion can have" not in out, out
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  the round ceiling is on one call, and says so")
+
+
 async def test_weights_reach_the_reader_not_the_members() -> None:
     """A weight is reported with the answers and withheld from the models.
 
@@ -293,7 +330,7 @@ async def test_weights_reach_the_reader_not_the_members() -> None:
     alpha, beta = member("alpha", weight=3), member("beta", weight=0.5)
     prompts: list[str] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, docs=None):
         prompts.append(prompt)
         return Answer(m, f"{m.label} says so", ok=True)
 
@@ -420,12 +457,12 @@ async def test_rounds_carry_the_previous_answers() -> None:
     beta = cfg.Member(id="b", model="m-b", base_url="https://h/v1", api_key="k", label="Beta")
     seen: list[tuple[str, str]] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, docs=None):
         seen.append((m.id, prompt))
         n = sum(1 for i, _ in seen if i == m.id)
         return Answer(m, f"{m.label} says {n}", ok=True)
 
-    async def only_alpha_answers(m, prompt, system=None):
+    async def only_alpha_answers(m, prompt, system=None, docs=None):
         seen.append((m.id, prompt))
         return Answer(m, f"{m.label} answer", ok=(m.id == "a"))
 
@@ -480,7 +517,7 @@ async def test_guests_join_the_argument() -> None:
 
     calls: list[tuple[str, str]] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, docs=None):
         calls.append((m.id, prompt))
         n = sum(1 for i, _ in calls if i == m.id)
         return Answer(m, f"{m.label} round {n}", ok=True)
@@ -566,7 +603,7 @@ async def test_revise_drives_a_round_from_outside() -> None:
 
     calls: list[tuple[str, str]] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, docs=None):
         calls.append((m.id, prompt))
         return Answer(m, f"{m.label} revised", ok=True)
 
@@ -654,7 +691,7 @@ async def test_revision_prompt_writes_for_the_seat_we_cannot_ask() -> None:
         return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
                           api_key="k", label=label)
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, docs=None):
         return Answer(m, f"{m.label} revised", ok=True)
 
     prior = [s.PriorAnswer(model="a", text="Alpha said indexes degrade"),
@@ -717,7 +754,7 @@ async def test_members_argue_with_letters_not_brands() -> None:
 
     calls: list[tuple[str, str]] = []
 
-    async def answering(m, prompt, system=None):
+    async def answering(m, prompt, system=None, docs=None):
         calls.append((m.id, prompt))
         n = sum(1 for i, _ in calls if i == m.id)
         return Answer(m, f"{m.label} round {n}", ok=True)
@@ -845,10 +882,12 @@ def test_shipped_example_is_valid() -> None:
              KIMI_KEY="sk-k", INTERNAL_KEY="sk-i"):
         c = cfg.load_council()
     assert not c.warnings, c.warnings
-    assert c.ids == ["gpt5", "codex", "glm", "kimi", "inhouse"], c.ids  # 'spare' is disabled
+    assert c.ids == ["gpt5", "codex", "glm", "small", "kimi", "inhouse"], c.ids  # 'spare' is off
     assert all(c.members[i].configured for i in c.ids), c.members
     assert c.members["inhouse"].proxy is False        # inherited from its provider
     assert c.members["gpt5"].proxy is None            # everyone else follows the env
+    assert not c.members["small"].vision and not c.members["small"].cache
+    assert c.members["gpt5"].vision and c.members["gpt5"].cache   # both default on
     print("ok  examples/config.json loads with no warnings")
 
 
@@ -1034,6 +1073,238 @@ def test_http_refuses_to_serve_the_world() -> None:
     print("ok  http refuses a network bind with no allowlist")
 
 
+# --------------------------------------------------------------------------- #
+# Material
+# --------------------------------------------------------------------------- #
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def test_material_loading() -> None:
+    """What is read, what is refused, and whether the refusal says why."""
+    from model_council import materials as mm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "spec.md").write_text("# Spec\nthe rule is x", encoding="utf-8")
+        (root / "shot.png").write_bytes(_PNG)
+        (root / "liar.png").write_bytes(b"not a png at all")
+        (root / "blob.bin").write_bytes(b"\x00\x01\x02\xff\xfe")
+
+        docs = mm.load([mm.Material(path=str(root / "spec.md")),
+                        mm.Material(label="shot", path=str(root / "shot.png")),
+                        mm.Material(label="note", text="an inline fragment")])
+        assert [d.label for d in docs] == ["spec.md", "shot", "note"], docs
+        assert docs[0].text == "# Spec\nthe rule is x" and not docs[0].is_image
+        assert docs[1].is_image and docs[1].media_type == "image/png"
+        assert base64.b64decode(docs[1].data) == _PNG
+        assert docs[2].origin == "" and docs[2].text == "an inline fragment"
+        # The describe() line is what the transcript shows the reader.
+        assert "spec.md" in docs[0].describe() and "of text" in docs[0].describe()
+        # A small file must not round to "0 KB", which reads as an empty one.
+        assert "20 B of text" in docs[0].describe(), docs[0].describe()
+        assert f"image/png, {len(_PNG)} B" in docs[1].describe(), docs[1].describe()
+
+        def refuses(spec, fragment: str) -> None:
+            try:
+                mm.load([spec])
+            except mm.MaterialError as e:
+                assert fragment in str(e), f"{fragment!r} not in {e}"
+            else:
+                raise AssertionError(f"should have refused: {spec}")
+
+        refuses(mm.Material(path=str(root / "nope.md")), "no such file")
+        refuses(mm.Material(path=str(root)), "is not a file")
+        refuses(mm.Material(path=str(root / "liar.png")), "not a png image")
+        refuses(mm.Material(path=str(root / "blob.bin")), "neither UTF-8 text nor an image")
+        refuses(mm.Material(path=str(root / "spec.md"), text="also this"), "both")
+
+        # An unreadable file must not be resolved into a partial council: the
+        # question would be answered anyway, about nothing.
+        saved = mm.get_policy()
+        try:
+            mm.set_policy(mm.Policy(allow_paths=False, why="it serves over HTTP"))
+            refuses(mm.Material(path=str(root / "spec.md")), "serves over HTTP")
+            # ...but inline text still works, which is what an HTTP caller has.
+            assert mm.load([mm.Material(text="inline")])[0].text == "inline"
+
+            inside = root / "sub"
+            inside.mkdir()
+            (inside / "ok.md").write_text("fine", encoding="utf-8")
+            mm.set_policy(mm.Policy(allow_paths=True, root=inside))
+            assert mm.load([mm.Material(path=str(inside / "ok.md"))])[0].text == "fine"
+            refuses(mm.Material(path=str(root / "spec.md")), "outside")
+
+            # A symlink is judged by where it lands, not where it sits.
+            (inside / "escape.md").symlink_to(root / "spec.md")
+            refuses(mm.Material(path=str(inside / "escape.md")), "outside")
+        finally:
+            mm.set_policy(saved)
+
+    assert mm.load(None) == [] and mm.load([mm.Material()]) == []
+    print("ok  material loading (files, images, caps, and who may read a path)")
+
+
+async def test_material_reaches_the_wire() -> None:
+    """The bytes actually sent: material first, question last, image as an image."""
+    from model_council import materials as mm
+    from model_council.providers import ask_member
+
+    docs = mm.load([mm.Material(label="Spec", text="the rule is x"),
+                    mm.Material(label="Shot", text="")])
+    docs = [docs[0], mm.Loaded(label="Shot", media_type="image/png",
+                               data=base64.b64encode(_PNG).decode(), size=len(_PNG))]
+
+    def member(fmt: str, **kw) -> cfg.Member:
+        return cfg.Member(id="x", model="m", base_url="https://h/v1", api_key="k",
+                          label="X", format=fmt, **kw)
+
+    with serving(_ok) as seen:
+        await ask_member(member("openai"), "so what breaks?", docs=docs)
+    body = json.loads(seen[0].content)["messages"][0]["content"]
+    assert [b["type"] for b in body] == ["text", "text", "image_url", "text"], body
+    assert "MATERIAL: Spec" in body[0]["text"] and "the rule is x" in body[0]["text"]
+    assert body[2]["image_url"]["url"].startswith("data:image/png;base64,"), body[2]
+    # Last, always: the question is read by a model that already has the material.
+    assert body[-1]["text"] == "so what breaks?", body[-1]
+
+    def anthropic_ok() -> httpx.Response:
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "pong"}]})
+
+    with serving(anthropic_ok) as seen:
+        await ask_member(member("anthropic"), "so what breaks?", docs=docs)
+    body = json.loads(seen[0].content)["messages"][0]["content"]
+    assert [b["type"] for b in body] == ["text", "text", "image", "text"], body
+    assert body[2]["source"] == {"type": "base64", "media_type": "image/png",
+                                 "data": base64.b64encode(_PNG).decode()}
+    # One cache breakpoint, at the end of the material — everything before it is
+    # what repeats across members and rounds, and nothing after it does.
+    assert body[2].get("cache_control") == {"type": "ephemeral"}, body[2]
+    assert not any("cache_control" in b for b in (body[0], body[1], body[3])), body
+
+    with serving(anthropic_ok) as seen:
+        await ask_member(member("anthropic", cache=False), "q", docs=docs)
+    body = json.loads(seen[0].content)["messages"][0]["content"]
+    assert not any("cache_control" in b for b in body), "cache: false was ignored"
+
+    # No material: the content stays the bare string it has always been.
+    with serving(_ok) as seen:
+        await ask_member(member("openai"), "just a question")
+    assert json.loads(seen[0].content)["messages"][0]["content"] == "just a question"
+    print("ok  material on the wire (ahead of the question, images as images)")
+
+
+async def test_truncation_is_not_silent() -> None:
+    """An answer stopped at a token ceiling must not read as a finished one."""
+    from model_council.providers import ask_member
+
+    def cut_openai() -> httpx.Response:
+        return httpx.Response(200, json={"choices": [
+            {"message": {"content": "half a th"}, "finish_reason": "length"}]})
+
+    def cut_anthropic() -> httpx.Response:
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "half a th"}],
+                                         "stop_reason": "max_tokens"})
+
+    base = dict(id="x", model="m", base_url="https://h/v1", api_key="k", label="X")
+    with serving(cut_openai):
+        a = await ask_member(cfg.Member(**base), "hi")
+    # Still an answer — it is real text, and the next round should read it.
+    assert a.ok and a.truncated and a.text.startswith("half a th"), a
+    assert "cut off" in a.text and "incomplete" in a.text, a.text
+
+    with serving(cut_anthropic):
+        a = await ask_member(cfg.Member(**base, format="anthropic", max_tokens=64), "hi")
+    assert a.ok and a.truncated and "max_tokens is 64" in a.text, a.text
+
+    with serving(_ok):
+        a = await ask_member(cfg.Member(**base), "hi")
+    assert a.ok and not a.truncated and a.text == "pong", a
+    print("ok  truncation (an answer cut at max_tokens says so, and still counts)")
+
+
+async def test_material_travels_every_round() -> None:
+    """Members are stateless, so round 2 gets the same bytes as round 1."""
+    from model_council import materials as mm
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    alpha = cfg.Member(id="a", model="m", base_url="https://h/v1", api_key="k", label="Alpha")
+    beta = cfg.Member(id="b", model="m", base_url="https://h/v1", api_key="k", label="Beta")
+    blind = cfg.Member(id="c", model="m", base_url="https://h/v1", api_key="k",
+                       label="Cyclops", vision=False)
+
+    seen: list[tuple[str, tuple[str, ...]]] = []
+
+    async def answering(m, prompt, system=None, docs=None):
+        seen.append((m.id, tuple(d.label for d in (docs or []))))
+        return Answer(m, f"{m.label} says so", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.md"
+            spec.write_text("the rule is x", encoding="utf-8")
+
+            s.COUNCIL = cfg.Council({"a": alpha, "b": beta}, "test")
+            out = await s.ask_all("what breaks?", rounds=2,
+                                  materials=[mm.Material(label="Spec", path=str(spec))])
+            assert seen == [("a", ("Spec",)), ("b", ("Spec",)),
+                            ("a", ("Spec",)), ("b", ("Spec",))], seen
+            assert "material on the table: Spec" in out, out
+            assert str(spec) in out, "the transcript should say what was read"
+
+            # An image excludes the members configured as unable to see it, and
+            # says which — a seat that answers about a screenshot it never saw
+            # would read exactly like one that did.
+            seen.clear()
+            shot = Path(tmp) / "shot.png"
+            shot.write_bytes(_PNG)
+            s.COUNCIL = cfg.Council({"a": alpha, "c": blind}, "test")
+            out = await s.ask_all("what breaks?", materials=[mm.Material(path=str(shot))])
+            assert [m for m, _ in seen] == ["a"], seen
+            assert "Cyclops" in out and "vision: false" in out, out
+
+            s.COUNCIL = cfg.Council({"c": blind}, "test")
+            out = await s.ask_all("what breaks?", materials=[mm.Material(path=str(shot))])
+            assert "nobody left to show it to" in out, out
+
+            # A material that cannot be read stops the call. The alternative is
+            # a council answering fluently about a document it never received.
+            out = await s.ask_all("what breaks?",
+                                  materials=[mm.Material(path=str(Path(tmp) / "gone.md"))])
+            assert "no such file" in out, out
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  material (carried into every round; images skip the blind seats)")
+
+
+async def test_revision_prompt_points_at_the_material() -> None:
+    """The seat we cannot call is told what to open, not handed it back."""
+    from model_council import materials as mm
+    from model_council import server as s
+
+    with tempfile.TemporaryDirectory() as tmp:
+        spec = Path(tmp) / "spec.md"
+        spec.write_text("the rule is x", encoding="utf-8")
+        written = await s.revision_prompt(
+            "what breaks?",
+            answers=[s.PriorAnswer(model="a", text="the index"),
+                     s.PriorAnswer(label="Subagent", text="the rollback")],
+            seat="Subagent", round=1,
+            materials=[mm.Material(label="Spec", path=str(spec)),
+                       mm.Material(label="Note", text="an inline fragment")])
+
+    # A file is named, at the position the members were given it: handing back
+    # the whole document would cost the caller a copy to write out again, which
+    # is the cost `materials` exists to remove.
+    assert written.index("MATERIAL: Spec") < written.index("THE QUESTION"), written
+    assert str(spec) in written and "the rule is x" not in written, written
+    # Something with no file behind it has nowhere to point, so it goes in whole.
+    assert "an inline fragment" in written, written
+    print("ok  revision_prompt (material is named for the seat, not pasted back)")
+
+
 def main() -> None:
     test_default_roster()
     test_env_roster()
@@ -1050,7 +1321,13 @@ def main() -> None:
     test_http_refuses_to_serve_the_world()
     asyncio.run(test_http_gate())
     asyncio.run(test_retry_transport())
+    test_material_loading()
+    asyncio.run(test_material_reaches_the_wire())
+    asyncio.run(test_truncation_is_not_silent())
+    asyncio.run(test_material_travels_every_round())
+    asyncio.run(test_revision_prompt_points_at_the_material())
     asyncio.run(test_rounds_carry_the_previous_answers())
+    asyncio.run(test_the_ceiling_is_on_the_call_not_the_discussion())
     asyncio.run(test_weights_reach_the_reader_not_the_members())
     asyncio.run(test_guests_join_the_argument())
     asyncio.run(test_revise_drives_a_round_from_outside())

@@ -21,6 +21,7 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from model_council.config import Member
+from model_council.materials import Loaded, heading
 
 _PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY")
 
@@ -51,6 +52,10 @@ class Answer:
     text: str
     ok: bool
     attempts: int = 1
+    # The endpoint stopped this answer at a token ceiling rather than at its
+    # end. The text is real and worth reading, so `ok` stays true; this is what
+    # lets a caller notice that a member was cut off without parsing the note.
+    truncated: bool = False
 
     def __str__(self) -> str:
         return self.text
@@ -87,11 +92,61 @@ def _proxy_hint(m: Member) -> str:
             '(an internal host, typically), give the member `"proxy": false`')
 
 
-async def _call_openai(m: Member, prompt: str, system: str | None) -> str:
+# --------------------------------------------------------------------------- #
+# What one request carries
+#
+# Material goes ahead of the question, in the order it was given, and the
+# question goes last. Two reasons, and neither is presentation. Every member and
+# every round then share a byte-identical prefix, which is the only shape an
+# endpoint's cache can match; and a model reads the question knowing what it is
+# about, rather than being asked to hold a question in mind through forty pages.
+#
+# With no material the content stays the bare string it has always been, so
+# nothing changes for a council that never passes any.
+# --------------------------------------------------------------------------- #
+def _openai_content(prompt: str, docs: list[Loaded]) -> str | list[dict]:
+    if not docs:
+        return prompt
+    parts: list[dict] = []
+    for d in docs:
+        if d.is_image:
+            parts.append({"type": "text", "text": heading(d)})
+            parts.append({"type": "image_url",
+                          "image_url": {"url": f"data:{d.media_type};base64,{d.data}"}})
+        else:
+            parts.append({"type": "text", "text": f"{heading(d)}\n{d.text}"})
+    parts.append({"type": "text", "text": prompt})
+    return parts
+
+
+def _anthropic_content(prompt: str, docs: list[Loaded], cache: bool) -> str | list[dict]:
+    if not docs:
+        return prompt
+    blocks: list[dict] = []
+    for d in docs:
+        if d.is_image:
+            blocks.append({"type": "text", "text": heading(d)})
+            blocks.append({"type": "image",
+                           "source": {"type": "base64", "media_type": d.media_type,
+                                      "data": d.data}})
+        else:
+            blocks.append({"type": "text", "text": f"{heading(d)}\n{d.text}"})
+    # One breakpoint, at the end of the material: everything before it is the
+    # same in every call of a discussion, and everything after it is not. This
+    # format has to be told where the reusable part stops; the OpenAI one has no
+    # equivalent field, and gateways that cache do it by prefix on their own.
+    if cache:
+        blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    blocks.append({"type": "text", "text": prompt})
+    return blocks
+
+
+async def _call_openai(m: Member, prompt: str, system: str | None,
+                       docs: list[Loaded]) -> tuple[str, str]:
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": _openai_content(prompt, docs)})
     payload: dict = {"model": m.model, "messages": messages}
     if m.temperature is not None:
         payload["temperature"] = m.temperature
@@ -105,20 +160,25 @@ async def _call_openai(m: Member, prompt: str, system: str | None) -> str:
         r.raise_for_status()
         data = r.json()
     try:
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise BadPayload(f"unexpected response shape: {str(data)[:600]}") from None
     if not content:
         raise BadPayload("empty response")
-    return content
+    cut = ("the endpoint stopped this answer at its own length limit"
+           if choice.get("finish_reason") == "length" else "")
+    return content, cut
 
 
-async def _call_anthropic(m: Member, prompt: str, system: str | None) -> str:
+async def _call_anthropic(m: Member, prompt: str, system: str | None,
+                          docs: list[Loaded]) -> tuple[str, str]:
     # max_tokens is required by this format, which is why it only applies here.
     payload: dict = {
         "model": m.model,
         "max_tokens": m.max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user",
+                      "content": _anthropic_content(prompt, docs, m.cache)}],
     }
     if system:
         payload["system"] = system
@@ -137,7 +197,9 @@ async def _call_anthropic(m: Member, prompt: str, system: str | None) -> str:
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     if not text:
         raise BadPayload(f"unexpected response shape: {str(data)[:600]}")
-    return text
+    cut = (f"this member's max_tokens is {m.max_tokens}, and the answer reached it"
+           if data.get("stop_reason") == "max_tokens" else "")
+    return text, cut
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +239,8 @@ def _backoff(attempt: int, base: float) -> float:
     return window / 2 + random.uniform(0, window / 2)
 
 
-async def ask_member(m: Member, prompt: str, system: str | None = None) -> Answer:
+async def ask_member(m: Member, prompt: str, system: str | None = None,
+                     docs: list[Loaded] | None = None) -> Answer:
     """Send one prompt to one member, retrying transient failures, never raising."""
     if not m.configured:
         return Answer(m, f"[{m.label} is not configured — missing {', '.join(m.missing)}. "
@@ -185,6 +248,7 @@ async def ask_member(m: Member, prompt: str, system: str | None = None) -> Answe
                       ok=False, attempts=0)
 
     call = _call_anthropic if m.format == "anthropic" else _call_openai
+    docs = docs or []
     attempts = m.retries + 1
     attempt = 0
     detail = ""
@@ -192,7 +256,15 @@ async def ask_member(m: Member, prompt: str, system: str | None = None) -> Answe
         attempt += 1
         wait: float | None = None
         try:
-            return Answer(m, await call(m, prompt, system), ok=True, attempts=attempt)
+            text, cut = await call(m, prompt, system, docs)
+            # An answer that stopped at a token ceiling reads as a finished one:
+            # it argues, then simply ends. Saying so is the difference between a
+            # position and a sentence that was interrupted — and it travels with
+            # the text into the next round, where another member is about to
+            # weigh it.
+            if cut:
+                text += f"\n\n[cut off — {cut}, so this answer is incomplete]"
+            return Answer(m, text, ok=True, attempts=attempt, truncated=bool(cut))
         except httpx.HTTPStatusError as e:
             detail = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
             if e.response.status_code not in _RETRYABLE_STATUS:

@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.10.0
+
+**The council can be handed the thing the question is about.** Until now the only
+way to put a document in front of the members was to paste it into `prompt` —
+and that is expensive in the place nobody watches. `prompt` is an argument the
+caller *writes*, so a long document costs a full copy of itself in generated
+tokens on every call, and what arrives is whatever the caller managed to
+reproduce. For forty pages that is not reliably the document, and a council
+reviewing a paraphrase is not reviewing the thing. Nothing in the transcript
+said so.
+
+```
+ask_all(
+  prompt="Where would this break under load?",
+  materials=[{"label": "The design", "path": "/abs/path/design.md"},
+             {"label": "Latency graph", "path": "/abs/path/p99.png"}],
+  rounds=2,
+)
+```
+
+`ask`, `ask_all`, `revise` and `revision_prompt` all take it. The server reads
+each material and puts it ahead of the question, in the same position for every
+member and every round. That position is the feature: identical bytes make the
+disagreement about the document rather than about which copy each member got,
+and everything up to the end of the material is the part that repeats across a
+discussion, so it is the part an endpoint can cache. The Anthropic format is
+told where that boundary is with one `cache_control` breakpoint; `"cache": false`
+turns it off for a gateway that rejects the field. Material with no file behind
+it goes in as `text`.
+
+**Images, which no amount of pasting could do.** This is the case that matters
+most, and not for convenience: a caller describing a screenshot in prose hands
+every member the *same* description, so a detail it misread is misread by the
+whole council at once, and cross-review cannot recover it. It is the one input
+where passing it badly quietly removes the independence the council exists for.
+Png, jpeg, gif and webp reach every member whose model can see. A member
+configured `"vision": false` sits the call out instead — answering about the text
+alone, in the same confident register as the members who saw the picture, is
+worse than one fewer opinion, and that answer would go into the next round as
+though it were informed. The transcript names who sat out. `list_council` grew a
+`sees` column so you can tell before you ask.
+
+A material that cannot be read **stops the call**, unlike a member that fails,
+which only degrades it. The reason is the same one running through the rest of
+this: a council asked about a document it never received will answer anyway, at
+length, and read exactly like one that had.
+
+`revision_prompt` *names* your files rather than pasting them back, at the
+position the members were given them. Handing the whole document back would cost
+the caller a copy to write out again, which is the cost this feature exists to
+remove — and the caller has the path.
+
+**Over HTTP, paths are refused.** Over stdio they need no flag, because whoever
+launched the process already reads every file it can — the same reasoning that
+lets a loopback bind skip `--allow`. Over HTTP the caller is whoever reached the
+port, a path would make one shared council a way to read its host's files, and
+what it read would leave for an external provider. `--materials-root DIR`
+(`COUNCIL_MATERIALS_ROOT`) opens exactly one directory, resolved before it is
+compared so a symlink is judged by where it lands. `list_council` reports which
+of the three it is, above the table, so a caller learns it without spending a
+failed call.
+
+**An answer cut off at a token ceiling now says so.** `stop_reason: max_tokens`
+and `finish_reason: length` were both being dropped, so an answer that stopped
+mid-argument came back looking finished — it argues, then simply ends. Worse, it
+then went into the next round for another member to weigh as a complete
+position. It stays an answer, because the text is real and worth reading, and
+gains a line saying where it stopped and (for the format that has the setting)
+which member's `max_tokens` to raise.
+
+**The rounds you did not commit to in advance.** `ask_all(rounds=2)` decides on
+the second round before the first one exists, so a council that turns out to
+agree costs exactly what one still arguing would. The tool that fixes this
+already existed — `revise` has always been the round you drive yourself, and has
+always been deliberately unbounded — but its description named only one reason to
+reach for it: seating a subagent as a full member. For a caller that is a model,
+the description is the API, and a chair wondering whether to buy another round
+would never have found the tool that sells one.
+
+Both descriptions now say it. `ask_all` names the commitment `rounds` makes and
+points at the alternative; `revise` leads with pacing and keeps the subagent loop
+as its second reason. Nothing about the mechanism changed.
+
+The one place the output was actively misleading is fixed too: a call that asked
+for 3 rounds and got them was shown a ceiling, and a ceiling reads as the end of
+what is possible. It is a ceiling on what one call will spend. The transcript now
+says so, and names the `revise` call that continues past it.
+
+One bug worth naming: a `--materials-root` under `/var` on macOS would have
+refused every file inside it, because `/var` is a symlink to `/private/var` and
+the root was compared unresolved — two spellings of one directory, and a refusal
+that named both and looked identical. The root is now resolved when the policy is
+built.
+
 ## 0.9.0
 
 **The members now argue anonymously; the caller alone keeps the names.** Inside a

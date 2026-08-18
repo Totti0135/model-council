@@ -10,20 +10,54 @@
 
 | 工具 | 作用 |
 |------|------|
-| `ask(model, prompt)` | 按 id 问其中一个成员 |
-| `ask_all(prompt, models?, rounds?, guests?)` | 并行问全体（或指定的几个），回答并排返回。`rounds=2` 让它变成一场讨论；`guests` 把你手上已有的回答请进来 |
-| `revise(prompt, answers, round?)` | 你自己推进一轮：把上一轮所有人说的话（包括只有你能产出的那些）摆给成员看，拿回它们修订后的回答 |
-| `revision_prompt(prompt, answers, seat)` | 生成你自己那一席下一轮该用的 prompt，与成员拿到的逐字一致。不发网络请求 |
-| `list_council()` | 花名册：id、端点、权重、调用预算、每个成员是否就绪。不发网络请求 |
+| `ask(model, prompt, materials?)` | 按 id 问其中一个成员 |
+| `ask_all(prompt, models?, rounds?, guests?, materials?)` | 并行问全体（或指定的几个），回答并排返回。`rounds=2` 让它变成一场讨论；`guests` 把你手上已有的回答请进来；`materials` 把要看的材料交给它们 |
+| `revise(prompt, answers, round?, materials?)` | 你自己推进一轮：把上一轮所有人说的话（包括只有你能产出的那些）摆给成员看，拿回它们修订后的回答 |
+| `revision_prompt(prompt, answers, seat, materials?)` | 生成你自己那一席下一轮该用的 prompt，与成员拿到的逐字一致。不发网络请求 |
+| `list_council()` | 花名册：id、端点、权重、每个成员能被喂什么、调用预算、是否就绪。不发网络请求 |
 | `probe_models(model?)` | 打某个端点的 `/models` 路由，看它到底提供哪些模型 id |
 
 成员是无状态的，看不到你的对话，所以主席每次调用都会把需要的信息全部带上。跨模型互评正是靠这一点实现的 —— 把甲的回答塞进乙的 `prompt` 里。
+
+### 把材料交给议会
+
+问题通常都是**关于**某样东西的 —— 一份方案、一段日志、一个 diff、一张截图。最顺手的做法是把它粘进 `prompt`，而这恰恰是最贵的做法，贵在一个没人盯着的地方：`prompt` 是主席**写出来**的参数，所以一份长文档每次调用都要花掉一整份自己的生成 token，而成员最终读到的，是主席当时复述出来的版本。四十页的东西，那多半已经不是原文了。议会评审的是一份转述，而记录里对此只字不提。
+
+`materials` 换成"指给它看"：
+
+```
+ask_all(
+  prompt="这套设计在高负载下会从哪里塌？",
+  materials=[
+    {"label": "设计稿", "path": "/abs/path/design.md"},
+    {"label": "P99 曲线", "path": "/abs/path/p99.png"},
+    {"label": "我的摘要", "text": "……某些没有对应文件的东西……"},
+  ],
+  rounds=2,
+)
+```
+
+服务器负责读取，并把它放在问题前面 —— 对每个成员、每一轮，都放在同一个位置。这个位置不是排版问题：
+
+- **字节完全一致。** 每个成员争论的是同一份副本，它们的分歧才是关于文档本身的，而不是关于各自拿到的是哪一版。
+- **前缀可以被缓存。** 材料结束之前的内容，在一场讨论的每次调用里都相同。anthropic 协议会被明确告知这条边界（在那里打一个 `cache_control` 断点）；靠前缀自动缓存的端点，本来就需要这个形状。个别网关不认这个字段，给该成员配 `"cache": false`。
+- **主席只付一次。** 一个路径对主席来说就是一行字，不是一整份文档；后续第 2、3 轮由 `ask_all` 自己带过去。
+
+**图片是最值得的一项。** 没有它，主席只能把截图转述成文字 —— 于是每个成员读到的是**同一份转述**，主席看漏的东西全体一起看漏，互评根本没机会纠正。这是唯一一类"传得潦草就会悄悄毁掉议会独立性"的输入。png、jpeg、gif、webp 会发给所有看得见的成员；看不见的成员应当配 `"vision": false`，它会**回避**带图的调用，而不是只拿到文字却装作看过图那样作答。记录里会写明谁回避了这一轮。
+
+**怎么判断哪些成员看不见：** 看不见的成员通常不会说自己看不见。开发这个功能时实测过的一个 anthropic 兼容网关，会照单收下 image 块、然后丢掉，模型接着报了一个颜色 —— 而不是按 prompt 明确要求的那样回答"没有收到图片"。同一个端点上的文字材料却完整送达，所以整次调用从外面看不出任何异常。给某个成员一张一眼能认的图，问它图里是什么；答得笃定又答错，就是这个症状，配上 `"vision": false` 即可。
+
+两个要记住的边界。材料读不出来会**中止整次调用** —— 一个没拿到文档的议会照样会侃侃而谈，读起来和真看过一模一样。另外，`revision_prompt` 只会**点名**你的文件（放在成员看到它的那个位置），不会把内容再吐回来，所以在把 prompt 交给你自己那一席之前，记得先替它打开这些文件。
+
+这个服务器到底读不读路径，取决于它是怎么启动的；HTTP 模式下默认不读，除非部署者[指定了一个目录](#material-over-http)。`list_council` 会在表格上方用一行说明当前是哪种。
 
 ### 多轮讨论
 
 `ask_all(prompt, rounds=2)` 把这套互评直接做掉。第一轮就是平常的并行提问；第二轮再去找每个成员，这次把原问题连同第一轮的**全部**回答一起带上 —— 它自己的和别人的，原文照搬 —— 让它据此修订：对的就采纳，错的就改，仍然不同意的地方讲清楚为什么。返回的记录按轮次分块，谁改了口、谁守住了立场，一眼看得见。
 
 **把上一轮带回去，就是这件事的全部机制。** 成员在两次调用之间什么都不记得，不带回去的话，所谓第二轮不过是把同一个问题又问了一遍。最多 3 轮；每多一轮就多一次逐成员的调用，且 prompt 比上一轮更长 —— 想要一份意见普查用 1 轮，问题的价值在于分歧本身时用 2 轮。
+
+**`rounds` 是在什么都还没问之前就定下的**，这是它唯一的毛病：你在没读到第一轮的情况下就为第二轮买了单，而一个最后发现大家意见一致的议会，花的钱和一个还在吵的议会一模一样。想先看看再说，就用 `rounds=1`，读完之后再用 [`revise`](#让-subagent-成为正式一员) 买下一轮 —— 它一次只跑一轮，你觉得值就再来一次，而且它自己没有轮数上限。先读再买通常是更便宜的那一侧：多一轮是每个成员一次完整调用，而 `revise` 只让你付把上一轮回答写回去的成本。`ask_all` 上的 3 是**单次调用**的花费上限，不是这场讨论的上限；真的跑到那里时，记录里会写明这一点。
 
 议会里的成员本来就少有旗鼓相当的，所以还可以给每个成员配[权重](#权重)。
 
@@ -201,12 +235,21 @@ stdio 模式下这个问题由操作系统回答：能拉起进程的人本来�
 | `--allow` | CIDR、单个地址，或者别名 `private`（RFC1918 全部）、`loopback`、`any` |
 | `--trust-proxy` | 哪些反向代理的 `X-Forwarded-For` 可以采信 |
 | `--allow-origin` | 放行某个浏览器 `Origin`，可重复 |
+| `--materials-root` | `materials` 路径唯一允许指向的目录；不设它，HTTP 模式一律拒绝路径 |
 
 `--trust-proxy` 值得多看一眼。不设它，`X-Forwarded-For` 会被完全忽略，由对端地址说了算 —— 挂在 nginx 后面时那就是 nginx，白名单要么放行所有人、要么谁都不放行。设了它之后，真实客户端取的是转发链里**最右边那个不是可信代理**的地址，这正是让别人没法靠伪造 `X-Forwarded-For: 10.0.0.1` 直接混进来的原因。
 
 带 `Origin` 头的请求默认一律拒绝。MCP 客户端不是浏览器，不会发这个头；网页则一定会发。白名单放行的是整个办公网，而那上面每台机器都跑着浏览器，浏览器会替它当前打开的任意页面发请求 —— `Origin` 就是区分这两者的依据。
 
 每个参数都有对应的环境变量（`COUNCIL_ALLOW`、`COUNCIL_TRUST_PROXY`、`COUNCIL_HTTP_HOST`……），`--help` 里列全了。
+
+<a name="material-over-http"></a>
+
+### HTTP 模式下的材料
+
+stdio 模式下，`materials` 能读进程能读的任何文件，且不需要任何开关：能拉起这个进程的人本来就有这个权限 —— 和 loopback 绑定不需要 `--allow` 是同一个道理。HTTP 模式下这个前提消失了：调用方是任何能连上端口的人，一个路径就会把共享议会变成读取宿主机文件的通道，而读到的内容还会发往外部 provider。所以 HTTP 部署**一律拒绝路径**，调用方改用 `text` 把内容带进来。
+
+`--materials-root /srv/council/material` 只打开一个目录，比较之前会先解析真实路径，所以软链接按它指向的位置判定。
 
 ### 它做不到什么
 
@@ -257,8 +300,8 @@ GLM_MODEL=glm-4.6
 GLM_FORMAT=anthropic
 ```
 
-每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_WEIGHT`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_RETRIES`、`_RETRY_BACKOFF`、`_HEADERS`（JSON 对象）、`_PROXY`、`_ENABLED`。
-全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_RETRIES`、`COUNCIL_RETRY_BACKOFF`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`。
+每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_WEIGHT`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_RETRIES`、`_RETRY_BACKOFF`、`_HEADERS`（JSON 对象）、`_PROXY`、`_VISION`、`_CACHE`、`_ENABLED`。
+全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_RETRIES`、`COUNCIL_RETRY_BACKOFF`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`、`COUNCIL_MATERIALS_ROOT`。
 
 不设 `COUNCIL_MODELS` 时，花名册默认是 `chatgpt,glm`，分别读 `CHATGPT_*` 和 `GLM_*`。
 
@@ -314,6 +357,8 @@ GLM_FORMAT=anthropic
 | `retries` | provider、member | 会话式失败额外可重试的次数。默认 2，上限 5，填 `0` 关闭 |
 | `retry_backoff` | provider、member | 第一次重试前等待的秒数，之后翻倍。默认 1 |
 | `proxy` | provider、member | 省略则跟随 `HTTP_PROXY`/`HTTPS_PROXY`；`false` 表示直连；填 URL 则走该代理 |
+| `vision` | member | 模型看不了图就填 `false`。它会回避带图的调用，而不是只拿到文字照样作答。默认 `true` |
+| `cache` | provider、member | 填 `false` 就不再随材料发送 `cache_control` 断点。仅 anthropic 协议；网关不认这个字段时关掉它。默认 `true` |
 | `enabled` | member | `false` 可以临时停用某个成员而不删配置 |
 
 `timeout`、`retries`、`retry_backoff` 也可以写在配置文件的顶层，作为所有成员继承的默认值。

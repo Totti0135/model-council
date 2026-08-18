@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "model-council",
   "display_name": "Model Council",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Consult other LLMs as tools — ask them, compare their answers, synthesize a conclusion.",
   "long_description": "Seats other LLMs at your table as tools, so your assistant can ask them, relay their answers back and forth for critique, and give you one merged conclusion — inside a single conversation, with no copy-paste.\n\nThe form below configures two seats, which is the smallest council worth having. Each takes an endpoint, a key, a model id, and which wire format that endpoint speaks: `openai` for anything OpenAI-compatible, `anthropic` for the Messages format. Setting the URL of an Anthropic-style endpoint without also setting the format is the one mistake that reliably breaks a seat.\n\nFor more than two members, or for several models sharing one endpoint and one key, point \"Config file\" at a JSON config instead; it takes precedence over the fields above. The project README documents its shape.",
   "author": {

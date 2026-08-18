@@ -40,9 +40,9 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 # Connection fields a member may inherit from its provider.
 _PROVIDER_FIELDS = {"base_url", "api_key", "format", "headers", "timeout", "proxy",
-                    "retries", "retry_backoff"}
+                    "retries", "retry_backoff", "cache"}
 _MEMBER_FIELDS = _PROVIDER_FIELDS | {
-    "id", "model", "label", "max_tokens", "temperature", "enabled", "weight",
+    "id", "model", "label", "max_tokens", "temperature", "enabled", "weight", "vision",
 }
 
 # A ceiling on retries, because the cost of a typo here is paid in real requests
@@ -122,6 +122,19 @@ class Member:
     # changes nothing about the call: it travels with the answer so that
     # whoever reads a disagreement knows which side the roster rates higher.
     weight: float = 1.0
+    # Whether this model can be shown an image. Default yes, because a member
+    # that cannot is the exception and the flag exists to name it — but naming
+    # it matters: an endpoint that quietly drops the image parts leaves this
+    # member answering about a screenshot it never saw, and nothing in its
+    # answer would give that away. A member marked blind sits out the calls that
+    # carry images, and the transcript says who sat out.
+    vision: bool = True
+    # Whether to mark the material as cacheable on the way out. Only the
+    # Anthropic format has a field for it; harmless where an endpoint ignores
+    # unknown keys, and this is the escape hatch for a gateway that rejects them
+    # instead. It belongs to the endpoint, not the seat, so it is inheritable
+    # from a provider.
+    cache: bool = True
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float = 180.0
     # Extra attempts a transient failure gets — a 429, a 5xx, a dropped
@@ -152,6 +165,8 @@ class Member:
         self.retries = max(0, min(int(self.retries), _MAX_RETRIES))
         self.retry_backoff = max(0.0, float(self.retry_backoff))
         self.weight = _clamp_weight(self.weight)
+        self.vision = bool(self.vision)
+        self.cache = bool(self.cache)
 
     @property
     def configured(self) -> bool:
@@ -209,6 +224,16 @@ def _env_json(name: str) -> dict:
         return {}
 
 
+_FALSE = ("0", "false", "no", "off")
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in _FALSE
+
+
 _DIRECT = {"false", "0", "no", "off", "none", "direct"}
 
 
@@ -255,6 +280,8 @@ def _member_from_env(member_id: str, defaults: dict, fallback: dict) -> Member:
         retry_backoff=float(
             os.environ.get(f"{p}_RETRY_BACKOFF", str(fallback["retry_backoff"]))),
         proxy=_env_proxy(p),
+        vision=_env_bool(f"{p}_VISION"),
+        cache=_env_bool(f"{p}_CACHE"),
         enabled=os.environ.get(f"{p}_ENABLED", "1").lower() not in ("0", "false", "no"),
     )
 

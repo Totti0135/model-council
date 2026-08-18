@@ -22,6 +22,7 @@ import sys
 from typing import Literal
 
 from mcp.server import MCPServer
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -57,9 +58,53 @@ def _unknown(ids: list[str]) -> str:
             f"Available: {_roster()}. Call list_council for details.]")
 
 
+class Guest(BaseModel):
+    """An answer the caller already holds, seated at the table.
+
+    The point of the council is that answers get read by the other answerers.
+    Anything you have obtained elsewhere — a subagent you spawned, your own
+    first take, a colleague's opinion — is worth more inside that mechanism
+    than beside it, and this is how it gets in.
+    """
+
+    label: str = Field(description="Who this answer is from, as it should appear "
+                                   "in the transcript, e.g. 'Subagent'.")
+    text: str = Field(description="The answer itself, verbatim. Do not summarise "
+                                  "it: the members are shown exactly this text, "
+                                  "and a summary is not the thing they would be "
+                                  "critiquing.")
+    weight: float = Field(default=1.0,
+                          description="How far this answer carries, on the same "
+                                      "scale as the members' weights. Default 1.")
+
+
+def _seat_guests(guests: list[Guest] | None) -> list[Answer]:
+    """Turn caller-supplied answers into seats at the table.
+
+    They become ordinary `Answer`s over a `Member` flagged as a guest, so every
+    downstream mechanism — labelling, the weight ranking, and above all the
+    revision prompt — treats them as participants without knowing what they are.
+    """
+    seated = []
+    for g in guests or []:
+        text = (g.text or "").strip()
+        if not text:
+            continue                 # an empty chair is not a participant
+        label = (g.label or "").strip() or "Guest"
+        seated.append(Answer(Member(id=f"guest:{label}", label=label,
+                                    weight=g.weight, guest=True),
+                             text, ok=True))
+    return seated
+
+
+def _origin(m: Member) -> str:
+    """What produced this answer, for its header."""
+    return "supplied by the caller" if m.guest else m.model
+
+
 def _labelled(a: Answer, weighted: bool) -> str:
     tag = f" · weight {a.member.weight:g}" if weighted else ""
-    return f"===== {a.member.label} ({a.member.model}){tag} =====\n{a.text}"
+    return f"===== {a.member.label} ({_origin(a.member)}){tag} =====\n{a.text}"
 
 
 def _round_block(n: int, total: int, what: str, answers: list[Answer],
@@ -68,6 +113,21 @@ def _round_block(n: int, total: int, what: str, answers: list[Answer],
     if total == 1:                       # a single round needs no ceremony
         return body
     return f"########## ROUND {n} of {total} — {what} ##########\n\n{body}"
+
+
+def _guest_note(seated: list[Answer]) -> str:
+    """Why the guests are missing from every round after the first.
+
+    Only worth saying once there is more than one round: a guest that vanishes
+    from round 2 looks like a member that dropped out or gave up its position,
+    and the reader is about to weigh exactly that kind of movement.
+    """
+    who = ", ".join(a.member.label for a in seated)
+    speaks = "speaks" if len(seated) == 1 else "speak"
+    return (f"[{who} {speaks} once. The answer above was shown to every member in the "
+            f"rounds that followed, and they argued with it — but a guest has nobody "
+            f"to ask for a revision, so it does not reappear. Its absence from the "
+            f"later rounds is not a position withdrawn.]")
 
 
 def _weight_note(members: list[Member]) -> str:
@@ -111,8 +171,17 @@ def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int
         f"--- YOUR OWN ROUND-{done} ANSWER ---\n"
         + (mine.text if mine else "(you did not answer)"),
     ]
-    blocks += [f"--- ROUND-{done} ANSWER FROM {a.member.label} ---\n{a.text}"
-               for a in answers if a.ok and a.member.id != me.id]
+    # A guest is presented as an answer like any other — nothing here says where
+    # it came from or what it is worth, for the same reason weights are withheld:
+    # a member should engage with the argument, not with its provenance. Only the
+    # fact that it will not answer back is stated, so its silence in the next
+    # round does not read as a position abandoned.
+    for a in answers:
+        if not a.ok or a.member.id == me.id:
+            continue
+        origin = (f"ANSWER FROM {a.member.label} (does not revise between rounds)"
+                  if a.member.guest else f"ROUND-{done} ANSWER FROM {a.member.label}")
+        blocks.append(f"--- {origin} ---\n{a.text}")
     blocks.append(
         "Now give your final answer to the question above. Weigh the other answers on "
         "their merits: take what is right, correct anything you got wrong, and say "
@@ -166,42 +235,70 @@ who held their ground.
 One round is a survey of opinion. Two is worth the extra latency and tokens when
 the answers are likely to disagree and the disagreement is the interesting part.
 
+`guests` seats answers you already have. If you spawned a subagent on this same
+question, or formed your own view first, pass it here as {label, text} and it
+joins the table: it appears in round 1 beside the members, and from round 2 the
+members are shown it verbatim and argue with it. This is the difference between
+an answer that is in the discussion and one that is merely next to it — without
+it, the models never learn your subagent had an opinion. Pass the text verbatim,
+not a summary; a summary is not what you want critiqued.
+
+A guest speaks once and does not revise, so it appears in round 1 only. The
+transcript says so, and says it is not a retraction.
+
 Members may carry different weights — how much this council trusts each one. When
 they do, every answer is labeled with its weight and the transcript ends with the
 ranking and how to read it. The members are never told each other's weights; a
 model told it is outranked stops arguing, and its dissent is what you came for.""")
 async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ignore[valid-type]
-                  system: str | None = None, rounds: int = 1) -> str:
+                  system: str | None = None, rounds: int = 1,
+                  guests: list[Guest] | None = None) -> str:
     members, unknown = COUNCIL.resolve(models)
+    seated = _seat_guests(guests)
     if not members:
-        return _unknown(unknown) if unknown else "[no council members are configured]"
+        if unknown:
+            return _unknown(unknown)
+        if seated:
+            return ("[no council members are configured, so there is nobody to put "
+                    "these answers in front of. A guest is seated to be argued with; "
+                    "with an empty roster this would only hand you back your own text.]")
+        return "[no council members are configured]"
 
-    # Weights are relative, so a roster that agrees on one number says nothing —
-    # and on the default roster that is every roster. Stay silent unless asked.
-    weighted = len({m.weight for m in members}) > 1
+    # Guests are weighed on the same scale as members, so the ranking has to see
+    # them. Weights are relative: a table that agrees on one number says nothing.
+    everyone = members + [a.member for a in seated]
+    weighted = len({m.weight for m in everyone}) > 1
 
     total = max(1, min(rounds, MAX_ROUNDS))
     answers = await asyncio.gather(*(ask_member(m, prompt, system) for m in members))
-    parts = [_round_block(1, total, "independent answers", answers, weighted)]
+
+    # `table` is what the next round is shown: this round's member answers plus
+    # the guests, who persist unchanged. `answers` alone is what each round's
+    # block prints, so a guest is not reprinted as though it had spoken again.
+    table = list(answers) + seated
+    parts = [_round_block(1, total, "independent answers", table, weighted)]
     note = ""
 
     for done in range(1, total):
-        answered = sum(a.ok for a in answers)
+        answered = sum(a.ok for a in table)
         if answered < 2:
             note = (f"\n\n[stopped after round {done}: a discussion needs at least two "
                     f"answers to put in front of each other, and this round produced "
                     f"{answered}.]")
             break
         answers = await asyncio.gather(
-            *(ask_member(m, _revision_prompt(prompt, answers, m, done), system)
+            *(ask_member(m, _revision_prompt(prompt, table, m, done), system)
               for m in members))
+        table = list(answers) + seated
         parts.append(_round_block(done + 1, total,
                                   "revised after reading the other answers", answers,
                                   weighted))
 
     out = "\n\n".join(parts) + note
+    if seated and total > 1:
+        out += f"\n\n{_guest_note(seated)}"
     if weighted:
-        out += f"\n\n{_weight_note(members)}"
+        out += f"\n\n{_weight_note(everyone)}"
     return out + (f"\n\n{_unknown(unknown)}" if unknown else "")
 
 

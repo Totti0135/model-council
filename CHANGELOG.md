@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.0
+
+**`ask_all` can seat an answer you already have: `guests`.** The chair is not
+only a chair — it can answer the question itself, and in Claude Code or Codex it
+can spawn a subagent to answer it too. Those answers used to sit beside the
+council's, compared by hand at the end. Now they can sit in it:
+
+```
+ask_all(prompt="...", guests=[{"label": "Subagent", "text": "..."}], rounds=2)
+```
+
+A guest appears in round 1 beside the members, and from round 2 every member is
+handed its text verbatim and asked to argue with it. That is the entire point:
+without it the models never learn the subagent had an opinion, and the comparison
+falls back to the chair — which is the work the rounds mechanism already does
+better, because it lets the models answer each other instead of into a void.
+
+A guest speaks once; nobody can be asked to revise it, so it does not reappear
+after round 1 and the transcript says why, because a seat that vanishes otherwise
+reads as a position abandoned. Members are told only that it will not answer
+back — not that it is a guest, nor what it is worth — for the same reason they
+are not told each other's weights: a member should engage with the argument, not
+with its provenance. Guests count toward the two answers a round needs, so one
+member and one subagent is a real discussion, and `weight` applies to them on the
+same scale as the members'. Nothing is configured and nothing persists: guests
+are per call.
+
 ## 0.5.0
 
 **`--http` serves a team from one deployment.** Until now the server only spoke

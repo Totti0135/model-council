@@ -18,7 +18,7 @@ self-run gateway, a local server, or several of each.
 | Tool | What it does |
 |------|--------------|
 | `ask(model, prompt)` | Ask one member by id |
-| `ask_all(prompt, models?, rounds?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion |
+| `ask_all(prompt, models?, rounds?, guests?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have |
 | `list_council()` | The roster: ids, endpoints, weights, call budget, and whether each member is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
@@ -43,6 +43,45 @@ where the disagreement is the interesting part.
 
 Members can also carry different [weights](#weights), for the common case where
 the council is not a council of equals.
+
+### Seating an answer you already have
+
+Your assistant is not only the chair — it can answer too, and in Claude Code or
+Codex it can spawn a subagent to answer as well. Those answers used to sit
+*beside* the council's, compared by hand at the end. `guests` puts them *in* it:
+
+```
+ask_all(
+  prompt="What are the traps in this plan?",
+  guests=[{"label": "Subagent", "text": "<what your subagent answered>"}],
+  rounds=2,
+)
+```
+
+Round 1 prints it beside the members. From round 2 every member is handed the
+text verbatim and asked to argue with it:
+
+```
+--- ANSWER FROM Subagent (does not revise between rounds) ---
+the migration has no rollback path
+```
+
+That is the whole difference. Without it the models never learn your subagent had
+an opinion, and you are left doing the comparison yourself — which is the work
+the rounds mechanism already does better, because it lets the models answer each
+other rather than answering into a void.
+
+Notes worth having:
+
+- **Pass the text verbatim, not a summary.** The members are shown exactly what
+  you pass, and a summary is not the thing you wanted critiqued.
+- **A guest speaks once.** There is nobody to ask it for a revision, so it does
+  not reappear after round 1. The transcript says so, because a seat that
+  vanishes otherwise reads as a position abandoned.
+- **A guest counts as a voice.** One member plus one guest is enough for a real
+  second round — your subagent against one model is still a discussion.
+- **`weight` works on guests too**, on the same scale as the members'.
+- Guests are per call. Nothing is configured, and nothing persists.
 
 ### Retries
 

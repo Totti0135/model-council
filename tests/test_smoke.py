@@ -463,6 +463,89 @@ async def test_rounds_carry_the_previous_answers() -> None:
     print("ok  rounds (round 2 carries every round-1 answer, and stops when it cannot)")
 
 
+async def test_guests_join_the_argument() -> None:
+    """An answer the caller already holds is seated, and argued with.
+
+    The point is not that it shows up in the transcript — that would be a
+    formatting change. It is that the members are handed it verbatim and asked
+    to respond, which is the whole difference between being in the discussion
+    and being printed next to it.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str, label: str, **kw) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=label, **kw)
+
+    calls: list[tuple[str, str]] = []
+
+    async def answering(m, prompt, system=None):
+        calls.append((m.id, prompt))
+        n = sum(1 for i, _ in calls if i == m.id)
+        return Answer(m, f"{m.label} round {n}", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    guest = s.Guest(label="Subagent", text="the migration has no rollback path")
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha"), "b": member("b", "Beta")}, "t")
+
+        two = await s.ask_all("Any traps here?", rounds=2, guests=[guest])
+        assert "Subagent (supplied by the caller)" in two, two
+        assert "the migration has no rollback path" in two
+
+        # The load-bearing assertion: both members were shown the guest's text
+        # in round 2, verbatim, and told it will not answer back.
+        round2 = {i: p for i, p in calls[2:]}
+        assert len(calls) == 4, calls
+        for who in ("a", "b"):
+            assert "the migration has no rollback path" in round2[who], \
+                f"{who} never saw the guest's answer"
+            assert "does not revise between rounds" in round2[who], round2[who]
+        assert not any(i.startswith("guest") for i, _ in calls), "a guest was called"
+
+        # It speaks once: round 2 prints the members only, and says why.
+        r2 = two.split("ROUND 2")[1]
+        assert "Subagent" not in r2.split("[Subagent speaks once")[0], \
+            "the guest was reprinted as though it had answered again"
+        assert "not a position withdrawn" in two, two
+
+        # One round has no later round to explain, so it stays quiet.
+        calls.clear()
+        one = await s.ask_all("Any traps here?", guests=[guest])
+        assert "Subagent (supplied by the caller)" in one
+        assert "speaks once" not in one, one
+
+        # A guest is enough of a second voice to make one member worth a round 2.
+        calls.clear()
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha")}, "t")
+        solo = await s.ask_all("Any traps here?", rounds=2, guests=[guest])
+        assert "stopped after round 1" not in solo, solo
+        assert "the migration has no rollback path" in calls[1][1], \
+            "the lone member was not shown the guest it was meant to argue with"
+
+        # Weights put guests on the same scale as members.
+        calls.clear()
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha", weight=2)}, "t")
+        ranked = await s.ask_all("q", guests=[s.Guest(label="Sub", text="x", weight=0.5)])
+        assert "[WEIGHTS — Alpha 2, Sub 0.5]" in ranked, ranked
+        assert "weight 0.5" in ranked, ranked
+
+        # An empty answer is not a participant.
+        calls.clear()
+        blank = await s.ask_all("q", guests=[s.Guest(label="Empty", text="   ")])
+        assert "Empty" not in blank, blank
+
+        # Nobody to argue with is a mistake worth naming, not a transcript of one.
+        s.COUNCIL = cfg.Council({}, "t")
+        alone = await s.ask_all("q", guests=[guest])
+        assert "nobody to put these answers in front of" in alone, alone
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  guests (seated, shown to the members verbatim, and argued with)")
+
+
 def test_registry_metadata_agrees() -> None:
     """server.json must name the same server the README claims ownership of,
     and every file that records a version must record the same one.
@@ -723,6 +806,7 @@ def main() -> None:
     asyncio.run(test_retry_transport())
     asyncio.run(test_rounds_carry_the_previous_answers())
     asyncio.run(test_weights_reach_the_reader_not_the_members())
+    asyncio.run(test_guests_join_the_argument())
     asyncio.run(test_tools())
 
 

@@ -134,6 +134,10 @@ class Member:
     proxy: str | bool | None = None
     enabled: bool = True
     disabled_reason: str = ""
+    # A seat the caller supplied an answer for, rather than one this server
+    # calls. Never set from configuration — guests arrive per request, and are
+    # gone when it ends.
+    guest: bool = False
 
     def __post_init__(self) -> None:
         self.label = self.label or self.id
@@ -149,6 +153,10 @@ class Member:
 
     @property
     def missing(self) -> list[str]:
+        # A guest arrives with its answer already given, so there is nothing to
+        # connect to and nothing that could be missing.
+        if self.guest:
+            return []
         return [f for f in ("base_url", "api_key", "model") if not getattr(self, f)]
 
 

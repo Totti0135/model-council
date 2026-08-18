@@ -64,7 +64,7 @@ Round 1 prints it beside the members. From round 2 every member is handed the
 text verbatim and asked to argue with it:
 
 ```
---- ANSWER FROM Subagent (does not revise between rounds) ---
+--- ANSWER C (does not revise between rounds) ---
 the migration has no rollback path
 ```
 
@@ -111,8 +111,8 @@ its own previous answer back as its own, and asked to move from it rather than
 answer fresh. An entry with `label` instead is a voice from outside the roster.
 
 **The members cannot tell the difference.** An outsider passed to `revise` is
-presented exactly as another member is — `--- ROUND-1 ANSWER FROM Subagent ---` —
-because it will answer again next round, and it is the same reason an `ask_all`
+presented exactly as another member is — a bare letter, `--- ROUND-1 ANSWER C ---`
+— because it will answer again next round, and it is the same reason an `ask_all`
 guest *is* flagged as finished. Describing a voice as done when it is about to
 speak again misrepresents the discussion to the models doing the arguing.
 
@@ -142,6 +142,40 @@ spends its own budget, while here every round is one you chose to pay for.
 | Calls | one | one per round |
 | Your voice | speaks once | revises every round |
 | Rounds driven by | the server | you |
+
+### The members argue anonymously
+
+Inside a revision round the other answers arrive as letters, never as names:
+
+```
+--- ROUND-1 ANSWER B ---
+concurrent writes race
+```
+
+A model name is the same kind of signal as a weight, and the stronger of the two:
+models hold firm priors about each other's makers. Withholding the number while
+printing the brand would close the smaller channel and leave the larger one open.
+What reaches a member is the argument, which is the thing we wanted weighed.
+
+Letters come from position at the table, so they are stable: `B` is the same seat
+to every member and in every round, which is what lets one of them say "B was
+wrong about the index" and still be understood next round.
+
+**You keep the names.** Every transcript that contains a revision round ends with
+the key:
+
+```
+[the members saw each other as letters, not names: A = GLM-5.3, B = GPT-5.6-sol,
+C = Subagent. ...]
+```
+
+You are the exception because you are the one who has to tell them apart — see
+who moved, who held, and who was talking about whom.
+
+One honest limit: this covers the labels the server writes, not a name a model
+puts inside its own answer. That prose is carried verbatim into the next round,
+because the alternative is editing the text the others are meant to be
+critiquing. Anonymity here removes the standing signal, not every mention.
 
 ### Retries
 

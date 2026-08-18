@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.0
+
+**The members now argue anonymously; the caller alone keeps the names.** Inside a
+revision round the other answers arrive as `ROUND-1 ANSWER B` rather than
+`ROUND-1 ANSWER FROM GPT-5.6-sol`. A model name is the same kind of signal as a
+weight and the stronger of the two — models hold firm priors about each other's
+makers — so hiding the number while printing the brand closed the smaller channel
+and left the larger one open. This closes it, on the same reasoning that kept the
+weights out of those prompts in 0.5.0.
+
+Letters come from position at the table, so they are stable: `B` is the same seat
+to every member and in every round, which is what lets one say "B was wrong about
+the index" and still be understood in the next one.
+
+Every transcript containing a revision round now ends with the key — `A = GLM-5.3,
+B = GPT-5.6-sol, C = Subagent`. The caller is the deliberate exception: it is the
+one who has to see who moved, who held, and who was arguing with whom.
+
+The limit is stated rather than implied, in the docs and in the test suite:
+anonymity covers the labels this server writes, not a name a model puts inside
+its own answer. That prose travels on verbatim, because the alternative is
+editing the text the others are supposed to be critiquing.
+
+This one came out of running the thing. Asked to weigh in on its own design, a
+subagent seated by `revise` argued the brand leak was real and of a piece with
+the weights — and GLM-5.3, reading it in round 2, changed its position and agreed.
+
 ## 0.8.0
 
 **`revision_prompt` writes the prompt for the one seat this server cannot ask.**

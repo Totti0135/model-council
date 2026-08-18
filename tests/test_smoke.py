@@ -507,7 +507,10 @@ async def test_guests_join_the_argument() -> None:
 
         # It speaks once: round 2 prints the members only, and says why.
         r2 = two.split("ROUND 2")[1]
-        assert "Subagent" not in r2.split("[Subagent speaks once")[0], \
+        # The answer-block form specifically: the guest is legitimately named in
+        # the letter key and in the note explaining its absence, and neither is
+        # it having spoken again.
+        assert "===== Subagent" not in r2, \
             "the guest was reprinted as though it had answered again"
         assert "not a position withdrawn" in two, two
 
@@ -574,19 +577,24 @@ async def test_revise_drives_a_round_from_outside() -> None:
 
         out = await s.revise(
             prompt="Any traps?",
-            answers=[s.PriorAnswer(model="a", text="Alpha said indexes degrade"),
-                     s.PriorAnswer(model="b", text="Beta said writes race"),
-                     s.PriorAnswer(label="Subagent", text="Subagent said no rollback")],
+            # Name-free on purpose: the labels are anonymised, but the prose is
+            # passed through untouched, so a fixture that says "Subagent said"
+            # would defeat the leak check below and prove nothing.
+            answers=[s.PriorAnswer(model="a", text="indexes will degrade"),
+                     s.PriorAnswer(model="b", text="concurrent writes race"),
+                     s.PriorAnswer(label="Subagent", text="the migration has no rollback")],
             round=1)
 
         seen = dict(calls)
         assert len(calls) == 2, calls
         # A named member gets its own answer back as its own — that is what makes
         # this a revision rather than the same question asked twice.
-        assert "YOUR OWN ROUND-1 ANSWER" in seen["a"] and "indexes degrade" in seen["a"]
-        assert "Beta said writes race" in seen["a"]
-        # And the outsider is just another member as far as the models can tell.
-        assert "ROUND-1 ANSWER FROM Subagent" in seen["a"], seen["a"]
+        assert "YOUR OWN ROUND-1 ANSWER" in seen["a"] and "indexes will degrade" in seen["a"]
+        assert "concurrent writes race" in seen["a"]
+        # And the outsider is just another member as far as the models can tell —
+        # since anonymity, literally so: a letter like everyone else.
+        assert "ROUND-1 ANSWER C" in seen["a"], seen["a"]
+        assert "Subagent" not in seen["a"], "the outsider was named to a member"
         assert "does not revise" not in seen["a"], \
             "the subagent was announced as finished, but it answers again next round"
         assert "Alpha revised" in out and "Beta revised" in out
@@ -690,6 +698,97 @@ async def test_revision_prompt_writes_for_the_seat_we_cannot_ask() -> None:
     finally:
         s.COUNCIL, s.ask_member = saved
     print("ok  revision_prompt (the caller's seat is asked on the members' terms)")
+
+
+async def test_members_argue_with_letters_not_brands() -> None:
+    """The members debate anonymously; the caller alone gets the key.
+
+    A model name is the same kind of signal as a weight, and a stronger one:
+    models hold priors about each other's makers. Withholding the number while
+    printing the brand would leave the larger channel open. The caller is the
+    exception because it is the one who has to tell them apart afterwards.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str, label: str) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=label)
+
+    calls: list[tuple[str, str]] = []
+
+    async def answering(m, prompt, system=None):
+        calls.append((m.id, prompt))
+        n = sum(1 for i, _ in calls if i == m.id)
+        return Answer(m, f"{m.label} round {n}", ok=True)
+
+    brands = ("GLM-5.3", "GPT-5.6-sol")
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a", brands[0]),
+                                 "b": member("b", brands[1])}, "t")
+        prior = [s.PriorAnswer(model="a", text="indexes degrade"),
+                 s.PriorAnswer(model="b", text="writes race"),
+                 s.PriorAnswer(label="Subagent", text="no rollback")]
+
+        out = await s.revise(prompt="Any traps?", answers=prior, round=1)
+        seen = dict(calls)
+
+        # Nobody's prompt may contain anybody's name.
+        for who, prompt in seen.items():
+            for brand in (*brands, "Subagent"):
+                assert brand not in prompt, f"{who} was shown the name {brand}"
+            assert "YOUR OWN ROUND-1 ANSWER" in prompt      # its own is still its own
+            assert "judge them by their reasoning" in prompt
+
+        # Letters are positional, so one letter is one model for everyone —
+        # otherwise "B was wrong" means different things to different members.
+        assert "ROUND-1 ANSWER B" in seen["a"] and "ROUND-1 ANSWER C" in seen["a"]
+        assert "ROUND-1 ANSWER A" in seen["b"] and "ROUND-1 ANSWER C" in seen["b"]
+        assert "ANSWER A" not in seen["a"], "a member was handed its own answer twice"
+        assert "ANSWER B" not in seen["b"], "a member was handed its own answer twice"
+        # Every seat's text still travels, whatever it is called.
+        for prompt in seen.values():
+            assert "no rollback" in prompt and "indexes degrade" in prompt
+
+        # The caller keeps the names, and is given the key to read the argument.
+        assert all(b in out for b in brands), out
+        assert "A = GLM-5.3, B = GPT-5.6-sol, C = Subagent" in out, out
+
+        # A guest is still marked as finished — that is process, not identity.
+        calls.clear()
+        await s.ask_all("Any traps?", rounds=2,
+                        guests=[s.Guest(label="Oneshot", text="a single remark")])
+        guest_round2 = dict(calls[2:])["a"]
+        assert "does not revise between rounds" in guest_round2
+        assert "Oneshot" not in guest_round2, "the guest's name leaked"
+
+        # Round 1 alone shows nobody anything, so there is no key to explain.
+        calls.clear()
+        one = await s.ask_all("Any traps?")
+        assert "saw each other as letters" not in one, one
+
+        # The honest limit, asserted rather than hoped for: anonymity covers the
+        # labels this server writes, not a name a model puts in its own prose.
+        # That text is carried verbatim — scrubbing it would mean editing an
+        # answer the members are supposed to be critiquing.
+        calls.clear()
+        leaky = [s.PriorAnswer(model="a", text="as GPT-5.6-sol argued, indexes degrade"),
+                 s.PriorAnswer(model="b", text="writes race")]
+        await s.revise(prompt="Any traps?", answers=leaky, round=1)
+        assert "GPT-5.6-sol" in dict(calls)["b"], \
+            "an answer was edited on its way to the other members"
+
+        # The caller's own seat is written on the same terms as the members'.
+        mine = await s.revision_prompt(prompt="Any traps?", answers=prior,
+                                       seat="Subagent", round=1)
+        assert "ROUND-1 ANSWER A" in mine and "ROUND-1 ANSWER B" in mine, mine
+        assert not any(b in mine for b in brands), "the caller's seat was shown brands"
+        assert "YOUR OWN ROUND-1 ANSWER" in mine and "no rollback" in mine
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  anonymity (members argue with letters; only the caller gets names)")
 
 
 def test_registry_metadata_agrees() -> None:
@@ -956,6 +1055,7 @@ def main() -> None:
     asyncio.run(test_guests_join_the_argument())
     asyncio.run(test_revise_drives_a_round_from_outside())
     asyncio.run(test_revision_prompt_writes_for_the_seat_we_cannot_ask())
+    asyncio.run(test_members_argue_with_letters_not_brands())
     asyncio.run(test_tools())
 
 

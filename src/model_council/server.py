@@ -158,6 +158,27 @@ def _weight_note(members: list[Member]) -> str:
     return "\n".join(lines)
 
 
+def _seat_letter(i: int) -> str:
+    """An identity-free name for a seat, from its position at the table.
+
+    Position, so it is stable: the same seat is the same letter to every member
+    and in every round, which is what lets a model say "B was wrong about X" and
+    be understood next round.
+    """
+    return chr(65 + i) if i < 26 else f"#{i + 1}"
+
+
+def _seat_key(answers: list[Answer]) -> str:
+    """Who was which letter — for the caller, who is the only one told."""
+    pairs = ", ".join(f"{_seat_letter(i)} = {a.member.label}"
+                      for i, a in enumerate(answers) if a.ok)
+    return (f"[the members saw each other as letters, not names: {pairs}. A model "
+            f"name is a standing signal about a source rather than evidence about "
+            f"the question, so it is kept out of their prompts for the same reason "
+            f"the weights are. You get the key because you are the one who has to "
+            f"tell them apart.]")
+
+
 def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int) -> str:
     """What a member is shown in a later round.
 
@@ -165,25 +186,35 @@ def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int
     discussion if the first one travels with it: the question restated, this
     member's own answer, and every other member's — verbatim, and only the ones
     that actually came back. An error string is not an opinion worth critiquing.
+
+    The other answers arrive as letters. A model name is a status signal exactly
+    as a weight is — models hold strong priors about each other's makers — and
+    withholding the number while printing the brand would leave the larger of the
+    two channels open. What survives is the argument, which is what we wanted
+    weighed. Note the limit honestly: this covers the labels we write, not a name
+    a model puts inside its own prose, which travels on into the next round.
     """
     mine = next((a for a in answers if a.member.id == me.id and a.ok), None)
     blocks = [
         f"Several AI models were asked the same question independently. Round {done} is "
-        f"finished and its answers are below; you are now in round {done + 1}.",
+        f"finished and its answers are below; you are now in round {done + 1}. They are "
+        f"labelled by letter rather than by model, deliberately: judge them by their "
+        f"reasoning, since that is all you are being given to judge.",
         f"--- THE QUESTION ---\n{question}",
         f"--- YOUR OWN ROUND-{done} ANSWER ---\n"
         + (mine.text if mine else "(you did not answer)"),
     ]
     # A guest is presented as an answer like any other — nothing here says where
-    # it came from or what it is worth, for the same reason weights are withheld:
-    # a member should engage with the argument, not with its provenance. Only the
-    # fact that it will not answer back is stated, so its silence in the next
-    # round does not read as a position abandoned.
-    for a in answers:
+    # it came from or what it is worth, for the same reason weights and names are
+    # withheld: a member should engage with the argument, not with its provenance.
+    # Only the fact that it will not answer back is stated, so its silence in the
+    # next round does not read as a position abandoned.
+    for i, a in enumerate(answers):
         if not a.ok or a.member.id == me.id:
             continue
-        origin = (f"ROUND-{done} ANSWER FROM {a.member.label}" if a.member.revises
-                  else f"ANSWER FROM {a.member.label} (does not revise between rounds)")
+        seat = _seat_letter(i)
+        origin = (f"ROUND-{done} ANSWER {seat}" if a.member.revises
+                  else f"ANSWER {seat} (does not revise between rounds)")
         blocks.append(f"--- {origin} ---\n{a.text}")
     blocks.append(
         "Now give your final answer to the question above. Weigh the other answers on "
@@ -298,6 +329,10 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
                                   weighted))
 
     out = "\n\n".join(parts) + note
+    if len(parts) > 1:
+        # Only after a revision round: round 1 is answered blind, so no member
+        # has seen another's letter yet and there is no key to explain.
+        out += f"\n\n{_seat_key(table)}"
     if seated and total > 1:
         out += f"\n\n{_guest_note(seated)}"
     if weighted:
@@ -407,6 +442,8 @@ async def revise(prompt: str, answers: list[PriorAnswer],
     # docs, because the failure is silent: a subagent re-run on the original
     # question repeats itself, the transcript looks like a discussion, and
     # nothing marks the round where that seat stopped taking part.
+    body += f"\n\n{_seat_key(table)}"
+
     outsiders = [a.member.label for a in table if a.member.guest]
     if outsiders:
         who = ", ".join(outsiders)

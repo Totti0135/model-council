@@ -8,8 +8,12 @@
   ],
 
   "$comment2": [
-    "timeout, retries and retry_backoff may also be set at the top level, as the",
-    "default every provider and member inherits. These are the built-in values."
+    "timeout, retries, retry_backoff and proxy may also be set at the top level,",
+    "as the default every provider and member inherits. These are the built-in",
+    "values; 'proxy' is left out here, which means every member follows whatever",
+    "HTTP_PROXY/HTTPS_PROXY this machine sets. Set it to false to send the whole",
+    "council straight out instead, or to a URL to put it behind one proxy — and",
+    "either way a single provider or member can still choose its own route."
   ],
   "timeout": 180,
   "retries": 2,
@@ -62,11 +66,18 @@
     },
 
     {
-      "$comment": "a member may skip 'provider' and carry its own connection",
+      "$comment": [
+        "a member may skip 'provider' and carry its own connection — and its own",
+        "route: this one is the only seat that needs a proxy, so it names one",
+        "rather than the council doing it for everybody. 'direct' is the opposite",
+        "move (see the 'internal' provider above), and both are printed by",
+        "list_council under 'route'."
+      ],
       "id": "kimi",
       "base_url": "https://api.moonshot.cn/v1",
       "api_key": "${KIMI_KEY}",
-      "model": "kimi-k2"
+      "model": "kimi-k2",
+      "proxy": "http://127.0.0.1:7890"
     },
 
     {

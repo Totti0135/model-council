@@ -28,11 +28,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from model_council import __version__
-from model_council.config import Member, load_council
+from model_council.config import Member, load_council, redact_proxy
 from model_council.materials import (Loaded, Material, MaterialError, Policy,
                                      get_policy, render_for_seat, set_policy)
 from model_council.materials import load as load_materials
-from model_council.providers import Answer, ask_member, probe_member
+from model_council.providers import Answer, ask_member, env_proxy, probe_member
 
 COUNCIL = load_council()
 
@@ -145,6 +145,21 @@ def _paths_note() -> str:
     if policy.root is not None:
         return f"allowed under {policy.root}"
     return "allowed (any file this server can read)"
+
+
+def _route(m: Member) -> str:
+    """Which way this member's traffic leaves, in the words the config uses.
+
+    Two members can differ here and nothing else in the table would show it, so
+    a council where one seat is behind a proxy and the rest are not looks
+    identical to one where they all are — until a call fails and only the reason
+    differs. The password, if the URL carries one, is not printed.
+    """
+    if isinstance(m.proxy, str) and m.proxy:
+        return redact_proxy(m.proxy)
+    if m.proxy is False:
+        return "direct"
+    return "env" if env_proxy()[0] else "direct"
 
 
 def _origin(m: Member) -> str:
@@ -663,24 +678,39 @@ async def list_council() -> str:
     above the table says whether this server will read `materials` paths at all,
     which depends on how its operator runs it.
 
+    `route` is how this member reaches its endpoint — `env` follows the proxy in
+    the server's environment, `direct` ignores it, and a URL is a proxy set for
+    that member alone. It appears only when the members can differ; passwords in
+    a proxy URL are masked.
+
     Cheap and local — makes no network calls. Use this to find out which ids you
     may pass to `ask` and `ask_all`, or to explain a configuration problem.
     """
-    rows = [("id", "label", "model", "weight", "format", "sees", "endpoint", "tries",
-             "status")]
+    rows = [("id", "label", "model", "weight", "format", "sees", "route", "endpoint",
+             "tries", "status")]
     for m in COUNCIL.members.values():
         status = "ready" if m.configured else f"missing {', '.join(m.missing)}"
         if not m.enabled:
             status = f"disabled — {m.disabled_reason}" if m.disabled_reason else "disabled"
         rows.append((m.id, m.label, m.model or "-", f"{m.weight:g}", m.format,
-                     "text+img" if m.vision else "text",
+                     "text+img" if m.vision else "text", _route(m),
                      m.base_url or "-", f"{m.retries + 1} × {m.timeout:g}s", status))
+
+    # The route column earns its width only when the routes can differ. With no
+    # proxy configured anywhere and none in the environment, every member says
+    # "direct" and the column is a wall of the same word.
+    var, val = env_proxy()
+    if not var and all(m.proxy is None for m in COUNCIL.members.values()):
+        rows = [r[:6] + r[7:] for r in rows]
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     table = "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
 
-    out = [f"config source: {COUNCIL.source}", f"material paths: {_paths_note()}", "",
-           table]
+    out = [f"config source: {COUNCIL.source}", f"material paths: {_paths_note()}"]
+    if var:
+        out.append(f"network: {var}={redact_proxy(val)} in this server's environment "
+                   f"— the members whose route is 'env' go through it")
+    out += ["", table]
     if COUNCIL.warnings:
         out += ["", "warnings:"] + [f"  - {w}" for w in COUNCIL.warnings]
     return "\n".join(out)

@@ -21,7 +21,7 @@ self-run gateway, a local server, or several of each.
 | `ask_all(prompt, models?, rounds?, guests?, materials?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have; `materials` hands them a file to read |
 | `revise(prompt, answers, round?, materials?)` | Run one more round yourself: show the members everything said last round — including answers only you can produce — and get them back revised |
 | `revision_prompt(prompt, answers, seat, materials?)` | The prompt to hand your own seat for the next round, word-for-word what the members got. No network calls |
-| `list_council()` | The roster: ids, endpoints, weights, what each member can be shown, call budget, and whether it is ready. No network calls |
+| `list_council()` | The roster: ids, endpoints, weights, what each member can be shown, the route each takes out, call budget, and whether it is ready. No network calls |
 | `probe_models(model?)` | Ask a provider's `/models` route what ids it really exposes |
 
 Members are stateless and cannot see your conversation, so the chair passes
@@ -470,8 +470,8 @@ GLM_FORMAT=anthropic
 Per member: `_BASE_URL`, `_API_KEY`, `_MODEL`, `_FORMAT`, `_LABEL`, `_WEIGHT`,
 `_MAX_TOKENS`, `_TEMPERATURE`, `_TIMEOUT`, `_RETRIES`, `_RETRY_BACKOFF`,
 `_HEADERS` (a JSON object), `_PROXY`, `_VISION`, `_CACHE`, `_ENABLED`. Globally:
-`COUNCIL_TIMEOUT`, `COUNCIL_RETRIES`, `COUNCIL_RETRY_BACKOFF`, `COUNCIL_CONFIG`,
-`COUNCIL_ENV_FILE`, `COUNCIL_MATERIALS_ROOT`.
+`COUNCIL_TIMEOUT`, `COUNCIL_RETRIES`, `COUNCIL_RETRY_BACKOFF`, `COUNCIL_PROXY`,
+`COUNCIL_CONFIG`, `COUNCIL_ENV_FILE`, `COUNCIL_MATERIALS_ROOT`.
 
 Omit `COUNCIL_MODELS` and the roster defaults to `chatgpt,glm`, reading
 `CHATGPT_*` and `GLM_*`.
@@ -539,13 +539,13 @@ The first three travel together as one unit — see the rule above.
 | `timeout` | provider, member | Seconds, per attempt. Default 180 |
 | `retries` | provider, member | Extra attempts a transient failure gets. Default 2, max 5, `0` to disable |
 | `retry_backoff` | provider, member | Seconds before the first retry, doubling from there. Default 1 |
-| `proxy` | provider, member | Omit to follow `HTTP_PROXY`/`HTTPS_PROXY`; `false` to connect directly; a URL to use that proxy |
+| `proxy` | top level, provider, member | The route out. Omit to follow `HTTP_PROXY`/`HTTPS_PROXY`; `false` to connect directly; a URL to use that proxy; `"env"` to rejoin the environment's. See [Proxies](#proxies) |
 | `vision` | member | `false` for a model that cannot be shown an image. It then sits out calls carrying one, rather than answering about the text alone. Default `true` |
 | `cache` | provider, member | `false` stops the `cache_control` breakpoint being sent with material. Anthropic format only; turn it off for a gateway that rejects the field. Default `true` |
 | `enabled` | member | `false` parks a member without deleting its config |
 
-`timeout`, `retries` and `retry_backoff` can also be set at the top level of the
-config file, as the default every member inherits.
+`timeout`, `retries`, `retry_backoff` and `proxy` can also be set at the top level
+of the config file, as the default every member inherits.
 
 ### Weights
 
@@ -584,6 +584,80 @@ and they are a prior, not a vote: they break ties and decide who carries the
 burden of proof. A specific, checkable reason from the lowest weight still beats
 a bare assertion from the highest.
 
+### Proxies
+
+Every member follows this machine's `HTTP_PROXY`/`HTTPS_PROXY`, which is the
+right default until a council spans hosts that do not share a route — a public
+API that only answers through the proxy, an internal gateway the proxy cannot
+see. One setting cannot be right for both, so the route is chosen per seat.
+
+`proxy` takes four values, on a member, on a provider, or at the top level of the
+config file as the council's own default:
+
+| Value | The route |
+|-------|-----------|
+| omitted | Follow the council's `proxy` if it sets one, else `HTTP_PROXY`/`HTTPS_PROXY` |
+| `false`, or `"direct"` | Straight out, ignoring both |
+| a URL | Through that proxy — `http://`, `https://`, `socks5://` or `socks5h://` |
+| `"env"` | Back onto `HTTP_PROXY`/`HTTPS_PROXY`, for one seat of a council routed elsewhere |
+
+Most specific wins: member, then provider, then the council, then the
+environment. So a council that is mostly behind a proxy, with two seats that must
+not be, says it once and then twice:
+
+```json
+{
+  "proxy": "http://127.0.0.1:7890",
+  "providers": {
+    "internal": { "base_url": "https://gateway.internal.example/v1",
+                  "api_key": "${INTERNAL_KEY}", "proxy": false }
+  },
+  "members": [
+    { "id": "gpt5",  "provider": "my-relay", "model": "gpt-5" },
+    { "id": "inhouse", "provider": "internal", "model": "some-internal-model" },
+    { "id": "local", "base_url": "http://127.0.0.1:11434/v1", "api_key": "-",
+      "model": "qwen3-8b", "proxy": false }
+  ]
+}
+```
+
+The same three moves through environment variables — `COUNCIL_PROXY` for the
+council, `<ID>_PROXY` for one member:
+
+```bash
+COUNCIL_PROXY=http://127.0.0.1:7890
+INHOUSE_PROXY=direct
+LOCAL_PROXY=direct
+```
+
+**`list_council` prints the route it settled on**, as `env`, `direct`, or the
+proxy URL, in a column that appears only when the members can differ:
+
+```
+network: HTTPS_PROXY=http://127.0.0.1:7890 in this server's environment — the members whose route is 'env' go through it
+
+id       label    model      weight  format  sees      route                  endpoint                          tries     status
+gpt5     GPT-5    gpt-5      1       openai  text+img  env                    https://your-host/v1              3 × 180s  ready
+inhouse  Inhouse  internal   1       openai  text+img  direct                 https://gateway.internal/v1       3 × 180s  ready
+kimi     Kimi     kimi-k2    1       openai  text+img  http://127.0.0.1:7890  https://api.moonshot.cn/v1        3 × 180s  ready
+```
+
+A password inside a proxy URL is masked wherever it is printed — the table, the
+warnings, the text of a connection error.
+
+**A proxy that cannot be used is caught when the roster is read**, not on the
+first call. `127.0.0.1:7890` with the scheme left off is read as
+`http://127.0.0.1:7890` and says so in the warnings; a scheme nothing can dial
+parks that member with the reason next to it in `list_council`, rather than
+letting it fail every call with a `ValueError` raised from inside a request. The
+member is parked rather than quietly sent another way: a proxy is named because
+someone wants the traffic to go that way.
+
+`socks5://` needs one package httpx does not install by default. Install the
+extra — `pip install 'model-council-mcp[socks]'`, or
+`uvx --from 'model-council-mcp[socks]' model-council-mcp` — or that member is
+parked with a note saying exactly this.
+
 ### Wire format notes
 
 - **`format` is not inferred from the URL.** Pointing `base_url` at an
@@ -599,7 +673,8 @@ a bare assertion from the highest.
   proxy cannot reach — an internal gateway, typically — it fails with a bare
   `ConnectError` that never mentions a proxy. Give that member or provider
   `"proxy": false` and it connects directly, while everyone else keeps using the
-  proxy. The error message says so too when a proxy is in play.
+  proxy; see [Proxies](#proxies). Connection errors name the route the member
+  was on, so the three policies do not all fail the same way.
 - **Model ids move fast.** Run `probe_models` to see what an endpoint actually
   offers today.
 
@@ -644,6 +719,10 @@ finishes with a live round-trip. To point a client at your working copy, use the
 - **A call takes far longer than the timeout** — retries multiply it: three
   attempts at 180s each is a worst case of ~9 minutes plus backoff. Lower
   `timeout`, or `retries`, for a member you would rather have fail fast.
+- **One member fails with a bare `ConnectError` while the rest are fine** — it is
+  usually the route, not the endpoint. The error names which route that member
+  was on; `list_council`'s `route` column shows all of them at once, and
+  [Proxies](#proxies) is how to change one.
 
 ## License
 

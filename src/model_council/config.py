@@ -20,6 +20,7 @@ mystery which one won.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -54,6 +55,23 @@ _MAX_RETRIES = 5
 # endpoint. Only ratios mean anything, and the ceiling keeps one member from
 # being given a number so large that every other answer rounds to noise.
 _MAX_WEIGHT = 10.0
+
+# The proxy schemes httpx can be handed. socks5/socks5h additionally need the
+# `socksio` package, which httpx only complains about when the first call is
+# made — too late, and reported as an ImportError against a member that looked
+# ready, so it is checked when the roster is read instead.
+_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+
+# What a proxy value means when it is not a URL. `direct` sends this member
+# straight out; `env` puts it back on whatever HTTP_PROXY/HTTPS_PROXY says,
+# which is how one member opts out of a council-wide proxy without repeating a
+# URL it does not care about.
+_DIRECT = {"false", "0", "no", "off", "none", "direct"}
+_FOLLOW = {"env", "environment", "system"}
+
+# host:port with the scheme left off — how proxies are written nearly
+# everywhere except in the one place that has to parse them.
+_HOST_PORT = re.compile(r"^(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+):\d{1,5}$")
 
 # Who you talk to, and how you prove who you are. These three travel together:
 # a member that names a provider may not override any of them, because taking
@@ -106,6 +124,74 @@ def _clamp_weight(value) -> float:
     return max(0.0, min(w, _MAX_WEIGHT))
 
 
+def _has_socks() -> bool:
+    try:
+        return importlib.util.find_spec("socksio") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def redact_proxy(value: str) -> str:
+    """A proxy URL with its password taken out, for anything a human will read.
+
+    Proxies are routinely written `http://user:secret@host:3128`, and this value
+    is about to appear in `list_council`'s table and in the text of a connection
+    error — both of which get pasted into issue reports and chat logs.
+    """
+    return re.sub(r"://([^:/@]*):[^@]*@", r"://\1:***@", value or "")
+
+
+def _read_proxy(value) -> tuple[str | bool | None, str, bool]:
+    """Resolve one configured proxy into (route, note, usable).
+
+    The route is `None` to follow the environment, `False` to go straight out,
+    or the URL to send this member through. The note is a sentence for
+    `list_council`'s warnings; `usable` False means the value cannot be handed
+    to httpx at all, and the member is parked rather than left to fail one call
+    at a time with a ValueError raised from inside a request.
+
+    Parking it is the deliberate part. The other options for an unusable proxy
+    are to fall back to the environment or to a direct connection — but a proxy
+    is named precisely because someone wants the traffic to go that way, and
+    quietly sending it another way is the one outcome nobody asked for.
+    """
+    if value is None or value is True:
+        # `true` is not a route: it says a proxy should be used without saying
+        # which. Read it as "follow the environment" — what leaving it out
+        # already means — and say so rather than guess.
+        note = ("proxy: true names no proxy, so this member follows the "
+                "environment, which is what omitting it does") if value is True else ""
+        return None, note, True
+    if value is False:
+        return False, "", True
+
+    raw = str(value).strip()
+    if not raw:
+        return None, "", True
+    low = raw.lower()
+    if low in _DIRECT:
+        return False, "", True
+    if low in _FOLLOW:
+        return None, "", True
+
+    if "://" not in raw:
+        if not _HOST_PORT.match(raw):
+            return raw, (f"proxy '{redact_proxy(raw)}' is not a URL — write it as "
+                         f"scheme://host:port, e.g. http://127.0.0.1:7890"), False
+        return f"http://{raw}", (f"proxy '{raw}' has no scheme — read as "
+                                 f"'http://{raw}'"), True
+
+    scheme = low.split("://", 1)[0]
+    if scheme not in _PROXY_SCHEMES:
+        return raw, (f"proxy scheme '{scheme}' cannot be used — httpx speaks "
+                     f"{', '.join(_PROXY_SCHEMES)}"), False
+    if scheme.startswith("socks") and not _has_socks():
+        return raw, ("a socks proxy needs the 'socksio' package, which is not "
+                     "installed here — reinstall as model-council-mcp[socks], or "
+                     "run `uvx --from 'model-council-mcp[socks]' model-council-mcp`"), False
+    return raw, "", True
+
+
 @dataclass
 class Member:
     """One seat on the council."""
@@ -142,9 +228,16 @@ class Member:
     # 0 restores the old behaviour of reporting the first failure as final.
     retries: int = 2
     retry_backoff: float = 1.0
-    # None = follow the environment's proxy settings (the default);
-    # False = connect directly, ignoring them; a URL = use that proxy.
+    # Which way this member's traffic leaves. None = follow the environment's
+    # HTTP_PROXY/HTTPS_PROXY (the default); False = connect directly, ignoring
+    # them; a URL = use that proxy. A council-wide default fills this in at load
+    # time, so by the time a Member exists the inheritance is already settled
+    # and None means the environment, never "ask someone else".
     proxy: str | bool | None = None
+    # Set when the configured proxy had to be corrected, or could not be used at
+    # all. Whichever loader built this member collects it into the council's
+    # warnings, so both configuration sources report the problem the same way.
+    proxy_note: str = ""
     enabled: bool = True
     disabled_reason: str = ""
     # A seat the caller supplied an answer for, rather than one this server
@@ -167,6 +260,10 @@ class Member:
         self.weight = _clamp_weight(self.weight)
         self.vision = bool(self.vision)
         self.cache = bool(self.cache)
+        self.proxy, self.proxy_note, routable = _read_proxy(self.proxy)
+        if not routable:
+            self.enabled = False
+            self.disabled_reason = self.disabled_reason or "its proxy cannot be used"
 
     @property
     def configured(self) -> bool:
@@ -234,16 +331,14 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return raw not in _FALSE
 
 
-_DIRECT = {"false", "0", "no", "off", "none", "direct"}
+def _env_proxy(name: str) -> str | None:
+    """One proxy variable, exactly as it was written, or None if it was not set.
 
-
-def _env_proxy(prefix: str) -> str | bool | None:
-    """`<ID>_PROXY`: unset = follow the environment, a falsey word = go direct,
-    anything else = the proxy URL to use."""
-    raw = os.environ.get(f"{prefix}_PROXY", "").strip()
-    if not raw:
-        return None
-    return False if raw.lower() in _DIRECT else raw
+    What the words in it mean — a URL, `direct`, `env` — is decided in one place,
+    when the member is built, so the file and the environment cannot drift into
+    reading the same value two ways.
+    """
+    return os.environ.get(name, "").strip() or None
 
 
 def _defaults(data: dict | None = None) -> dict:
@@ -258,6 +353,12 @@ def _defaults(data: dict | None = None) -> dict:
         "retries": int(data.get("retries", os.environ.get("COUNCIL_RETRIES", "2"))),
         "retry_backoff": float(
             data.get("retry_backoff", os.environ.get("COUNCIL_RETRY_BACKOFF", "1"))),
+        # The route every member takes unless it says otherwise. Both directions
+        # are one line from here: a URL puts the whole council behind a proxy and
+        # a single member can still be sent `direct`, and `false` sends the
+        # council straight out past a proxy the rest of this machine is using
+        # while one member is given a URL of its own.
+        "proxy": data["proxy"] if "proxy" in data else _env_proxy("COUNCIL_PROXY"),
     }
 
 
@@ -279,11 +380,15 @@ def _member_from_env(member_id: str, defaults: dict, fallback: dict) -> Member:
         retries=int(os.environ.get(f"{p}_RETRIES", str(fallback["retries"]))),
         retry_backoff=float(
             os.environ.get(f"{p}_RETRY_BACKOFF", str(fallback["retry_backoff"]))),
-        proxy=_env_proxy(p),
+        proxy=_env_proxy(f"{p}_PROXY") or fallback["proxy"],
         vision=_env_bool(f"{p}_VISION"),
         cache=_env_bool(f"{p}_CACHE"),
         enabled=os.environ.get(f"{p}_ENABLED", "1").lower() not in ("0", "false", "no"),
     )
+
+
+def _proxy_warnings(members: dict[str, Member]) -> list[str]:
+    return [f"member '{i}': {m.proxy_note}" for i, m in members.items() if m.proxy_note]
 
 
 def _from_env() -> Council:
@@ -296,7 +401,7 @@ def _from_env() -> Council:
     }
     source = ("environment (COUNCIL_MODELS)" if listed
               else "environment (default roster: %s)" % ", ".join(ids))
-    return Council(members, source)
+    return Council(members, source, _proxy_warnings(members))
 
 
 # --------------------------------------------------------------------------- #
@@ -371,7 +476,7 @@ def _from_file(path: Path) -> Council:
             warnings.append(f"duplicate member id '{member_id}' — later one wins")
         members[member_id] = Member(**base)
 
-    return Council(members, f"file: {path}", warnings)
+    return Council(members, f"file: {path}", warnings + _proxy_warnings(members))
 
 
 def _config_path() -> tuple[Path | None, list[str]]:

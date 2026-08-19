@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.11.0
+
+**The route out is chosen per seat, and the council can have a default.** A
+member could already be given `"proxy": false` or a URL of its own, and that
+half of it is unchanged. What was missing is the other half: there was no way to
+say *"everyone through here, except these two"*. The proxy for a whole council
+lived in `HTTP_PROXY`, which belongs to the machine and not to this server, so
+the common shape — most members behind a company proxy, one internal gateway the
+proxy cannot see — meant repeating a URL on every member and hoping the next one
+added got it too.
+
+`proxy` now also takes a council-wide default, at the top level of the config
+file or as `COUNCIL_PROXY`, and the most specific setting wins: member, then
+provider, then the council, then the environment. A fourth value completes it —
+`"env"` puts one member back on `HTTP_PROXY` when the council has been routed
+elsewhere, which previously required writing out a URL the member did not care
+about.
+
+```json
+{
+  "proxy": "http://127.0.0.1:7890",
+  "members": [
+    { "id": "gpt5", "provider": "my-relay", "model": "gpt-5" },
+    { "id": "inhouse", "provider": "internal", "model": "some-internal-model",
+      "proxy": false }
+  ]
+}
+```
+
+**`list_council` prints the route.** Nothing in the table used to show it, so a
+council where one seat is behind a proxy and the rest are not read exactly like
+one where they all are — and the route is the only thing that explains why one
+member times out while its neighbours on the same endpoint list are fine. The
+column says `env`, `direct`, or the proxy URL, and appears only when the members
+can actually differ; a line above the table names the environment's proxy when
+there is one. A password inside a proxy URL is masked wherever it is printed.
+
+**A proxy that cannot be used is caught when the roster is read.** httpx rejects
+a malformed proxy from inside the request, so `127.0.0.1:7890` — the scheme left
+off, which is how proxies are written everywhere else — made a member that
+reported `ready` fail every call with a `ValueError` about a URL scheme, an error
+nobody would connect to the line they typed in a config file. That spelling is
+now read as `http://127.0.0.1:7890` and says so in the warnings. A scheme nothing
+can dial parks the member instead, with the reason next to it in `list_council`,
+rather than quietly falling back to another route: a proxy is named precisely
+because someone wants the traffic to go that way. `socks5://` is supported and
+needs one package httpx does not install by default — the member is parked with
+a note naming the `[socks]` extra, instead of raising `ImportError` mid-request.
+
+**Connection errors name the route they took.** All three policies fail
+identically from the outside — a bare `ConnectError` — and each has a different
+fix, so the message now says whether this member was following the environment's
+proxy, ignoring it, or going through one of its own.
+
 ## 0.10.0
 
 **The council can be handed the thing the question is about.** Until now the only

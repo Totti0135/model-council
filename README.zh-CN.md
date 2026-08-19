@@ -14,7 +14,7 @@
 | `ask_all(prompt, models?, rounds?, guests?, materials?)` | 并行问全体（或指定的几个），回答并排返回。`rounds=2` 让它变成一场讨论；`guests` 把你手上已有的回答请进来；`materials` 把要看的材料交给它们 |
 | `revise(prompt, answers, round?, materials?)` | 你自己推进一轮：把上一轮所有人说的话（包括只有你能产出的那些）摆给成员看，拿回它们修订后的回答 |
 | `revision_prompt(prompt, answers, seat, materials?)` | 生成你自己那一席下一轮该用的 prompt，与成员拿到的逐字一致。不发网络请求 |
-| `list_council()` | 花名册：id、端点、权重、每个成员能被喂什么、调用预算、是否就绪。不发网络请求 |
+| `list_council()` | 花名册：id、端点、权重、每个成员能被喂什么、各自走哪条线路出去、调用预算、是否就绪。不发网络请求 |
 | `probe_models(model?)` | 打某个端点的 `/models` 路由，看它到底提供哪些模型 id |
 
 成员是无状态的，看不到你的对话，所以主席每次调用都会把需要的信息全部带上。跨模型互评正是靠这一点实现的 —— 把甲的回答塞进乙的 `prompt` 里。
@@ -301,7 +301,7 @@ GLM_FORMAT=anthropic
 ```
 
 每个成员可用：`_BASE_URL`、`_API_KEY`、`_MODEL`、`_FORMAT`、`_LABEL`、`_WEIGHT`、`_MAX_TOKENS`、`_TEMPERATURE`、`_TIMEOUT`、`_RETRIES`、`_RETRY_BACKOFF`、`_HEADERS`（JSON 对象）、`_PROXY`、`_VISION`、`_CACHE`、`_ENABLED`。
-全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_RETRIES`、`COUNCIL_RETRY_BACKOFF`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`、`COUNCIL_MATERIALS_ROOT`。
+全局可用：`COUNCIL_TIMEOUT`、`COUNCIL_RETRIES`、`COUNCIL_RETRY_BACKOFF`、`COUNCIL_PROXY`、`COUNCIL_CONFIG`、`COUNCIL_ENV_FILE`、`COUNCIL_MATERIALS_ROOT`。
 
 不设 `COUNCIL_MODELS` 时，花名册默认是 `chatgpt,glm`，分别读 `CHATGPT_*` 和 `GLM_*`。
 
@@ -356,12 +356,12 @@ GLM_FORMAT=anthropic
 | `timeout` | provider、member | 秒，单次尝试的上限。默认 180 |
 | `retries` | provider、member | 会话式失败额外可重试的次数。默认 2，上限 5，填 `0` 关闭 |
 | `retry_backoff` | provider、member | 第一次重试前等待的秒数，之后翻倍。默认 1 |
-| `proxy` | provider、member | 省略则跟随 `HTTP_PROXY`/`HTTPS_PROXY`；`false` 表示直连；填 URL 则走该代理 |
+| `proxy` | 顶层、provider、member | 出网线路。省略则跟随 `HTTP_PROXY`/`HTTPS_PROXY`；`false` 表示直连；填 URL 则走该代理；填 `"env"` 表示回到环境里的代理。见[代理](#代理) |
 | `vision` | member | 模型看不了图就填 `false`。它会回避带图的调用，而不是只拿到文字照样作答。默认 `true` |
 | `cache` | provider、member | 填 `false` 就不再随材料发送 `cache_control` 断点。仅 anthropic 协议；网关不认这个字段时关掉它。默认 `true` |
 | `enabled` | member | `false` 可以临时停用某个成员而不删配置 |
 
-`timeout`、`retries`、`retry_backoff` 也可以写在配置文件的顶层，作为所有成员继承的默认值。
+`timeout`、`retries`、`retry_backoff`、`proxy` 也可以写在配置文件的顶层，作为所有成员继承的默认值。
 
 ### 权重
 
@@ -387,12 +387,68 @@ These are this council's standing priors on its members, not votes. ...
 
 **成员之间永远看不到彼此的权重。** 一个被告知"你不如别人"的模型会停止争辩、转而附和，而这恰好会赔掉组建议会本来要的那份独立异见 —— 所以第二轮带回去的是别人的回答，不是别人的分量。权重是给读这份记录的人看的，而且它是**先验，不是选票**：它用来打破平局、决定谁负举证责任。**来自最低权重的一条具体的、可核验的理由，依然胜过最高权重的一句空断言。**
 
+### 代理
+
+所有成员默认跟随这台机器的 `HTTP_PROXY`/`HTTPS_PROXY`。这个默认值一直是对的，直到议会同时坐着两类端点：一类只有走代理才通，另一类（典型是内网网关）恰恰是代理到不了的。一个开关不可能同时对这两边都对，所以**线路是按席位分别决定的**。
+
+`proxy` 有四种取值，可以写在 member 上、写在 provider 上，也可以写在配置文件顶层作为整个议会的默认：
+
+| 取值 | 走哪条线路 |
+|------|-----------|
+| 省略 | 有议会级 `proxy` 就跟随它，否则跟随 `HTTP_PROXY`/`HTTPS_PROXY` |
+| `false` 或 `"direct"` | 直连，两者都不理会 |
+| 一个 URL | 走这个代理 —— 支持 `http://`、`https://`、`socks5://`、`socks5h://` |
+| `"env"` | 回到 `HTTP_PROXY`/`HTTPS_PROXY`，用于整个议会已被指到别处、而这一席要留在环境代理上的情况 |
+
+**越具体越优先**：member → provider → 议会默认 → 环境变量。所以"大部分走代理、有两席不能走"，就是先说一次、再说两次：
+
+```json
+{
+  "proxy": "http://127.0.0.1:7890",
+  "providers": {
+    "internal": { "base_url": "https://gateway.internal.example/v1",
+                  "api_key": "${INTERNAL_KEY}", "proxy": false }
+  },
+  "members": [
+    { "id": "gpt5",  "provider": "my-relay", "model": "gpt-5" },
+    { "id": "inhouse", "provider": "internal", "model": "some-internal-model" },
+    { "id": "local", "base_url": "http://127.0.0.1:11434/v1", "api_key": "-",
+      "model": "qwen3-8b", "proxy": false }
+  ]
+}
+```
+
+用环境变量是同样三步 —— `COUNCIL_PROXY` 管整个议会，`<ID>_PROXY` 管某一个成员：
+
+```bash
+COUNCIL_PROXY=http://127.0.0.1:7890
+INHOUSE_PROXY=direct
+LOCAL_PROXY=direct
+```
+
+**`list_council` 会打印每个成员最终走的线路** —— `env`、`direct` 或代理 URL。这一列只在成员之间可能不同的时候才出现：
+
+```
+network: HTTPS_PROXY=http://127.0.0.1:7890 in this server's environment — the members whose route is 'env' go through it
+
+id       label    model      weight  format  sees      route                  endpoint                          tries     status
+gpt5     GPT-5    gpt-5      1       openai  text+img  env                    https://your-host/v1              3 × 180s  ready
+inhouse  Inhouse  internal   1       openai  text+img  direct                 https://gateway.internal/v1       3 × 180s  ready
+kimi     Kimi     kimi-k2    1       openai  text+img  http://127.0.0.1:7890  https://api.moonshot.cn/v1        3 × 180s  ready
+```
+
+代理 URL 里如果带密码，凡是打印出来的地方都会打码 —— 表格、警告、连接失败的报错文本。
+
+**填错的代理在读花名册时就会被发现**，不必等到第一次调用。少写协议头的 `127.0.0.1:7890` 会被读成 `http://127.0.0.1:7890` 并在警告里说明；而一个根本拨不出去的协议头会让那个成员被停用，理由就写在 `list_council` 里，而不是让它每次调用都从请求内部抛一个 `ValueError`。选择停用而不是悄悄改走别的线路，是因为：既然特意指定了代理，就是希望流量从那里走。
+
+`socks5://` 需要一个 httpx 默认不装的包。装上附加依赖 —— `pip install 'model-council-mcp[socks]'`，或 `uvx --from 'model-council-mcp[socks]' model-council-mcp` —— 否则那个成员会被停用，并附上说明这件事的提示。
+
 ### 协议注意事项
 
 - **`format` 不会从 URL 推断。** 把 `base_url` 指向 Anthropic 风格的端点却没同时设 `format: "anthropic"`，成员仍然停留在 OpenAI 协议上，每次调用都会失败。**这是最常见的配置错误。**
 - **Anthropic 端点：** 服务器会拼 `{base_url}/v1/messages`，所以 `base_url` 里不要已经带上 `/v1`。
 - **OpenAI 兼容端点：** 服务器只用 `/chat/completions`，不用 `/responses`。有些网关两个都提供，但 `/responses` 可能注入供应方指定的系统人格，对一个通用顾问模型来说是错的。
-- **系统代理默认会被沿用。** 如果某个成员在代理到不了的网络上（典型是内网网关），它会以一个光秃秃的 `ConnectError` 失败，字面上完全看不出跟代理有关。给那个成员或 provider 加 `"proxy": false` 就直连，其余成员照旧走代理。当环境里确实有代理时，错误信息也会主动提示这一点。
+- **系统代理默认会被沿用。** 如果某个成员在代理到不了的网络上（典型是内网网关），它会以一个光秃秃的 `ConnectError` 失败，字面上完全看不出跟代理有关。给那个成员或 provider 加 `"proxy": false` 就直连，其余成员照旧走代理，详见[代理](#代理)。连接失败的报错会点明这个成员当时走的是哪条线路，三种策略不会都失败成同一副样子。
 - **模型 id 变得很快。** 用 `probe_models` 看看某个端点今天到底提供什么。
 
 ## 怎么用
@@ -427,6 +483,7 @@ uv run python tests/test_smoke.py
 - **模型 id 被拒** —— 跑 `probe_models`。
 - **某个成员回了 `gave up after N attempts`** —— 它每一次都失败了，错误文本是端点最后一次给的那条。`list_council` 会以 `尝试次数 × 超时` 的形式显示每个成员的预算。
 - **一次调用比超时时间长得多** —— 重试是乘上去的：3 次尝试、每次 180 秒，最坏情况约 9 分钟，还要加上退避等待。希望某个成员"快速失败"的话，把它的 `timeout` 或 `retries` 调小。
+- **只有某一个成员报光秃秃的 `ConnectError`，其他都正常** —— 多半是线路问题，不是端点问题。报错会点明那个成员当时走的是哪条线路，`list_council` 的 `route` 一列可以一眼看全，改法见[代理](#代理)。
 
 ## 许可
 

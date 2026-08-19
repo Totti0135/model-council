@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "model-council",
   "display_name": "Model Council",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Consult other LLMs as tools — ask them, compare their answers, synthesize a conclusion.",
   "long_description": "Seats other LLMs at your table as tools, so your assistant can ask them, relay their answers back and forth for critique, and give you one merged conclusion — inside a single conversation, with no copy-paste.\n\nThe form below configures two seats, which is the smallest council worth having. Each takes an endpoint, a key, a model id, and which wire format that endpoint speaks: `openai` for anything OpenAI-compatible, `anthropic` for the Messages format. Setting the URL of an Anthropic-style endpoint without also setting the format is the one mistake that reliably breaks a seat.\n\nFor more than two members, or for several models sharing one endpoint and one key, point \"Config file\" at a JSON config instead; it takes precedence over the fields above. The project README documents its shape.",
   "author": {
@@ -35,12 +35,14 @@
         "FIRST_MODEL": "${user_config.first_model}",
         "FIRST_FORMAT": "${user_config.first_format}",
         "FIRST_WEIGHT": "${user_config.first_weight}",
+        "FIRST_PROXY": "${user_config.first_proxy}",
 
         "SECOND_BASE_URL": "${user_config.second_base_url}",
         "SECOND_API_KEY": "${user_config.second_api_key}",
         "SECOND_MODEL": "${user_config.second_model}",
         "SECOND_FORMAT": "${user_config.second_format}",
-        "SECOND_WEIGHT": "${user_config.second_weight}"
+        "SECOND_WEIGHT": "${user_config.second_weight}",
+        "SECOND_PROXY": "${user_config.second_proxy}"
       }
     }
   },
@@ -80,6 +82,13 @@
       "required": false
     },
 
+    "first_proxy": {
+      "type": "string",
+      "title": "First model — proxy (optional)",
+      "description": "Leave empty to use whatever proxy this machine already sets. Put 'direct' here for an endpoint your proxy cannot reach, such as a company-internal gateway, or a URL like http://127.0.0.1:7890 to send only this seat through a proxy of its own. The two seats are set separately, because a council usually spans hosts that do not share a route.",
+      "required": false
+    },
+
     "second_base_url": {
       "type": "string",
       "title": "Second model — endpoint",
@@ -114,6 +123,13 @@
       "required": false
     },
 
+    "second_proxy": {
+      "type": "string",
+      "title": "Second model — proxy (optional)",
+      "description": "Same three choices as above, decided for this seat alone: empty to follow the machine's proxy, 'direct' to ignore it, or a proxy URL.",
+      "required": false
+    },
+
     "council_models": {
       "type": "string",
       "title": "Seats to enable",
@@ -141,7 +157,7 @@
     { "name": "ask_all", "description": "Ask several members the same prompt in parallel, optionally over two rounds so each one revises after reading the others, and optionally seating answers you already have." },
     { "name": "revise", "description": "Run one more round of a discussion you are driving, so an answer only you can produce takes part as a full member." },
     { "name": "revision_prompt", "description": "Build the prompt for your own seat's next round, identical to what the members receive." },
-    { "name": "list_council", "description": "List the members, their endpoints, and whether each is ready." },
+    { "name": "list_council", "description": "List the members, their endpoints, the route each takes out, and whether each is ready." },
     { "name": "probe_models", "description": "Ask an endpoint which model ids it actually exposes." }
   ]
 }

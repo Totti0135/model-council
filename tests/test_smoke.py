@@ -34,9 +34,12 @@ def env(**overrides: str):
     saved = dict(os.environ)
     saved_default = cfg.DEFAULT_CONFIG_PATH
     for k in list(os.environ):
+        # `_PROXY` also clears HTTP_PROXY/HTTPS_PROXY, which is the point: a
+        # developer behind a proxy would otherwise get a different route — and a
+        # different `list_council` table — from everyone else running this.
         if k.startswith("COUNCIL_") or k.endswith(
             ("_BASE_URL", "_API_KEY", "_MODEL", "_FORMAT", "_HEADERS", "_ENABLED",
-             "_WEIGHT")
+             "_WEIGHT", "_PROXY")
         ):
             del os.environ[k]
     os.environ["COUNCIL_ENV_FILE"] = "/nonexistent"
@@ -202,6 +205,154 @@ def test_proxy_policy() -> None:
     assert e.members["a"].proxy is False
     assert e.members["b"].proxy == "http://p:3128"
     print("ok  proxy policy (inherit / direct / explicit, config and env)")
+
+
+def test_proxy_defaults_and_overrides() -> None:
+    """One route for the council, and the seats that take a different one.
+
+    The reason this is not just a per-member field: a council usually splits
+    into a majority that needs the proxy and a minority that must not use it (or
+    the reverse). Without a default, the majority is retyped on every member,
+    and a member added later quietly gets the wrong route.
+    """
+    doc = {
+        "proxy": "http://gateway:3128",
+        "providers": {
+            "corp": {"base_url": "https://internal.example/v1", "api_key": "k",
+                     "proxy": False},
+            "public": {"base_url": "https://api.example/v1", "api_key": "k"},
+        },
+        "members": [
+            {"id": "default", "provider": "public", "model": "m"},
+            {"id": "internal", "provider": "corp", "model": "m"},
+            {"id": "own", "provider": "public", "model": "m",
+             "proxy": "http://other:8080"},
+            {"id": "follows", "provider": "public", "model": "m", "proxy": "env"},
+            {"id": "out", "provider": "corp", "model": "m", "proxy": "direct"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    assert c.members["default"].proxy == "http://gateway:3128"   # the council's route
+    assert c.members["internal"].proxy is False                  # provider beats council
+    assert c.members["own"].proxy == "http://other:8080"         # member beats both
+    assert c.members["follows"].proxy is None                    # back onto the environment
+    assert c.members["out"].proxy is False                       # straight out
+    assert not c.warnings, c.warnings
+
+    # and the same three moves through the environment
+    with env(COUNCIL_MODELS="a,b,c", COUNCIL_PROXY="http://gateway:3128",
+             B_PROXY="direct", C_PROXY="env"):
+        e = cfg.load_council()
+    assert e.members["a"].proxy == "http://gateway:3128"
+    assert e.members["b"].proxy is False
+    assert e.members["c"].proxy is None
+    print("ok  proxy defaults (council-wide route, overridden per provider and member)")
+
+
+def test_a_proxy_that_cannot_be_used_is_caught_at_load() -> None:
+    """A proxy typo is a configuration error, not one failed call per member.
+
+    httpx rejects these from inside the request, so the member reads as `ready`
+    until it is asked, and then reports a ValueError about a URL scheme that
+    nobody would connect to the line they typed in a config file. Reading the
+    roster is the moment to say it.
+    """
+    from model_council.providers import _client, _proxy_hint
+
+    doc = {"members": [
+        {"id": "noscheme", "base_url": "https://a/v1", "api_key": "k", "model": "m",
+         "proxy": "127.0.0.1:7890"},
+        {"id": "nonsense", "base_url": "https://a/v1", "api_key": "k", "model": "m",
+         "proxy": "gopher://p:70"},
+        {"id": "secretive", "base_url": "https://a/v1", "api_key": "k", "model": "m",
+         "proxy": "http://user:hunter2@p:3128"},
+    ]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    # A bare host:port is how everyone writes a proxy. Assume http, say so, and
+    # keep the member — and prove httpx will actually take what we assumed.
+    assert c.members["noscheme"].proxy == "http://127.0.0.1:7890"
+    assert c.members["noscheme"].enabled
+    assert "no scheme" in c.members["noscheme"].proxy_note
+    _client(c.members["noscheme"])
+
+    # A scheme nothing can dial is not a route. The member is parked, with the
+    # reason where a caller reads it, rather than left to fail every call.
+    assert not c.members["nonsense"].enabled
+    assert "proxy" in c.members["nonsense"].disabled_reason
+    assert "nonsense" not in c.ids and "noscheme" in c.ids, c.ids
+    joined = " ".join(c.warnings)
+    assert "gopher" in joined and "noscheme" in joined, c.warnings
+
+    # A password in a proxy URL must not reach anything a human will read: the
+    # table, the warnings, or the text of a connection error.
+    assert cfg.redact_proxy("http://user:hunter2@p:3128") == "http://user:***@p:3128"
+    hint = _proxy_hint(c.members["secretive"])
+    assert "hunter2" not in hint and "user:***@p:3128" in hint, hint
+
+    # socks needs a package httpx does not install by default; without it the
+    # first call raises ImportError from inside a request. Park it here instead.
+    if not cfg._has_socks():
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text(json.dumps({"members": [
+                {"id": "sock", "base_url": "https://a/v1", "api_key": "k", "model": "m",
+                 "proxy": "socks5://127.0.0.1:1080"}]}), encoding="utf-8")
+            with env(COUNCIL_CONFIG=str(path)):
+                sc = cfg.load_council()
+        assert not sc.members["sock"].enabled
+        assert "socksio" in " ".join(sc.warnings), sc.warnings
+    print("ok  proxy diagnosis (scheme fixed or member parked, passwords masked)")
+
+
+async def test_the_route_is_visible() -> None:
+    """A council split across two routes must not read like one that is not.
+
+    Everything else in `list_council` is about which model answers; the route is
+    the only line that explains why one member times out while the rest are
+    fine, and it is invisible in the config the caller cannot see.
+    """
+    from model_council import server as s
+
+    def member(i: str, proxy=None) -> cfg.Member:
+        return cfg.Member(id=i, model="m", base_url="https://h/v1", api_key="k",
+                          label=i, proxy=proxy)
+
+    saved = s.COUNCIL
+    try:
+        # Nothing configured, nothing in the environment: every member goes
+        # straight out, and a column saying so ten times is noise.
+        s.COUNCIL = cfg.Council({"a": member("a"), "b": member("b")}, "test")
+        with env():
+            plain = await s.list_council()
+        assert "route" not in plain and "network:" not in plain, plain
+
+        # A proxy in the environment applies to everyone, so say which one.
+        with env(HTTPS_PROXY="http://127.0.0.1:7890"):
+            followed = await s.list_council()
+        assert "route" in followed and followed.count("env") >= 2, followed
+        assert "HTTPS_PROXY=http://127.0.0.1:7890" in followed, followed
+
+        # One member off on its own is exactly the case the column exists for.
+        s.COUNCIL = cfg.Council(
+            {"a": member("a"), "b": member("b", "http://user:hunter2@box:3128"),
+             "c": member("c", False)}, "test")
+        with env():
+            split = await s.list_council()
+        assert "http://user:***@box:3128" in split and "hunter2" not in split, split
+        assert "direct" in split, split
+    finally:
+        s.COUNCIL = saved
+    print("ok  list_council shows the route, and only when the routes can differ")
 
 
 def test_retry_settings() -> None:
@@ -885,6 +1036,7 @@ def test_shipped_example_is_valid() -> None:
     assert c.ids == ["gpt5", "codex", "glm", "small", "kimi", "inhouse"], c.ids  # 'spare' is off
     assert all(c.members[i].configured for i in c.ids), c.members
     assert c.members["inhouse"].proxy is False        # inherited from its provider
+    assert c.members["kimi"].proxy == "http://127.0.0.1:7890"   # its own route
     assert c.members["gpt5"].proxy is None            # everyone else follows the env
     assert not c.members["small"].vision and not c.members["small"].cache
     assert c.members["gpt5"].vision and c.members["gpt5"].cache   # both default on
@@ -1311,6 +1463,9 @@ def main() -> None:
     test_file_config()
     test_connection_is_atomic()
     test_proxy_policy()
+    test_proxy_defaults_and_overrides()
+    test_a_proxy_that_cannot_be_used_is_caught_at_load()
+    asyncio.run(test_the_route_is_visible())
     test_retry_settings()
     test_weights()
     test_registry_metadata_agrees()

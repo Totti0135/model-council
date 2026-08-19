@@ -1,6 +1,6 @@
 [project]
 name = "model-council-mcp"
-version = "0.10.0"
+version = "0.11.0"
 description = "An MCP server that lets your assistant consult other LLMs — ask them, compare their answers, and synthesize a conclusion."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,12 @@ dependencies = [
     "mcp>=2,<3",
     "httpx>=0.27.0",
 ]
+
+[project.optional-dependencies]
+# A socks proxy needs one more package than httpx installs by default. Without
+# it a `socks5://` proxy fails on the first call, from inside the request; the
+# roster refuses to seat such a member instead, and names this extra.
+socks = ["httpx[socks]>=0.27.0"]
 
 [project.scripts]
 model-council-mcp = "model_council.server:main"

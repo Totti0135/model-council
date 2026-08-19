@@ -20,10 +20,23 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from model_council.config import Member
+from model_council.config import Member, redact_proxy
 from model_council.materials import Loaded, heading
 
 _PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY")
+
+
+def env_proxy() -> tuple[str, str]:
+    """The proxy this server's own environment applies, and which variable set
+    it — ("", "") when there is none. A member that names no route of its own
+    takes this one, so it belongs in `list_council` and in any error about a
+    connection that never arrived."""
+    for var in _PROXY_VARS:
+        val = os.environ.get(var, "").strip()
+        if val:
+            return var, val
+    return "", ""
+
 
 # Failures worth another attempt: the endpoint is busy, rate-limited, or briefly
 # broken, and the same request may well succeed in a moment. Everything else —
@@ -73,6 +86,10 @@ def _client(m: Member, timeout: float | None = None) -> httpx.AsyncClient:
     cannot reach — an internal gateway behind a VPN fails with a bare
     ConnectError that says nothing about a proxy being involved. `proxy: false`
     is the escape hatch; a URL routes this member through a specific proxy.
+
+    The choice is per member on purpose: a council usually spans hosts that do
+    not share a route — a public API that needs the proxy, an internal gateway
+    the proxy cannot see — and the setting that fixes one breaks the other.
     """
     kwargs: dict = {"timeout": m.timeout if timeout is None else timeout}
     if m.proxy is False:
@@ -83,13 +100,27 @@ def _client(m: Member, timeout: float | None = None) -> httpx.AsyncClient:
 
 
 def _proxy_hint(m: Member) -> str:
-    """A connection failure through an inherited proxy looks like a plain
-    ConnectError, which says nothing about the proxy. Say it instead."""
-    if m.proxy is not None or not any(os.environ.get(v) for v in _PROXY_VARS):
+    """A connection failure says nothing about the route it took, and the route
+    is the part that differs between members. Name it.
+
+    Each of the three policies fails in a way that looks identical from the
+    outside — a bare ConnectError — and has a different fix, so the hint says
+    which one this member was on rather than leaving the reader to check the
+    config against the environment.
+    """
+    if isinstance(m.proxy, str) and m.proxy:
+        return (f" — this member is routed through {redact_proxy(m.proxy)}, and a proxy "
+                f"that is down or cannot reach the endpoint fails exactly like the "
+                f"endpoint being down")
+    var, val = env_proxy()
+    if not var:
         return ""
-    return (" — note a proxy is set in this server's environment and this member "
-            "follows it; if the endpoint is not reachable through that proxy "
-            '(an internal host, typically), give the member `"proxy": false`')
+    if m.proxy is False:
+        return (f" — this member is configured `proxy: false`, so it ignored "
+                f"{var} and connected directly")
+    return (f" — note {var}={redact_proxy(val)} is set in this server's environment "
+            f"and this member follows it; if the endpoint is not reachable through "
+            f'that proxy (an internal host, typically), give the member `"proxy": false`')
 
 
 # --------------------------------------------------------------------------- #

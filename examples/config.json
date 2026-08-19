@@ -67,6 +67,31 @@
 
     {
       "$comment": [
+        "'backups' are further endpoints for the SAME seat, tried in order when",
+        "the one before them does not answer — after it has spent its own",
+        "retries, and for any reason it did not: the host is down, the key was",
+        "revoked, the relay stopped carrying that model id. One seat, one vote,",
+        "one label; you never address a backup directly, and 'sol' below reaches",
+        "whichever of the three is up.",
+        "A backup inherits the seat's model and its call budget, so the common",
+        "case — the same model on a second relay — is the one line below. Say",
+        "'model' only when the other channel names it differently. What is never",
+        "inherited is the connection itself (that is the point), the headers, and",
+        "the route: this seat goes direct for an internal gateway, and its public",
+        "backups still follow the proxy.",
+        "ask_all prints which endpoint answered above the answer, because a",
+        "backup is often a different model than the one you configured."
+      ],
+      "id": "sol", "provider": "internal", "model": "gpt-5-codex", "label": "Codex",
+      "backups": [
+        { "provider": "my-relay" },
+        { "base_url": "https://another-relay.example/v1", "api_key": "${SPARE_KEY}",
+          "model": "gpt-5-codex-latest" }
+      ]
+    },
+
+    {
+      "$comment": [
         "a member may skip 'provider' and carry its own connection — and its own",
         "route: this one is the only seat that needs a proxy, so it names one",
         "rather than the council doing it for everybody. 'direct' is the opposite",

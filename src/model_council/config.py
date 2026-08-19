@@ -8,6 +8,12 @@ The abstraction has two layers:
 One provider can host many members (a relay that exposes several models), and a
 member may inline its own connection details instead of naming a provider.
 
+A member may also list `backups`: further connections for the same seat, tried
+in order when the one before it does not answer. The seat keeps its id, label
+and weight throughout — a backup is the same voice reached another way, not a
+second opinion — and whichever connection answered is reported with the answer,
+because a backup may be running a different model than the one you configured.
+
 Configuration arrives from whichever of these is most explicit:
 
   1. the JSON file COUNCIL_CONFIG points at
@@ -46,6 +52,12 @@ _MEMBER_FIELDS = _PROVIDER_FIELDS | {
     "id", "model", "label", "max_tokens", "temperature", "enabled", "weight", "vision",
 }
 
+# How many backups one seat may list. A seat is one model's opinion, not a
+# high-availability cluster: past a handful of dead endpoints the honest result
+# is that this seat is down, and `ask_all` runs its members in parallel, so the
+# whole call waits on the slowest chain to finish failing.
+_MAX_BACKUPS = 4
+
 # A ceiling on retries, because the cost of a typo here is paid in real requests
 # to a real provider: `"retries": 50` should not turn one question into fifty.
 _MAX_RETRIES = 5
@@ -82,6 +94,29 @@ _HOST_PORT = re.compile(r"^(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+):\d{1,5}$")
 # to the host, not which host or which credential, and over TLS a proxy sees
 # only a CONNECT tunnel.
 _ATOMIC_CONNECTION = {"base_url", "api_key", "format"}
+
+# What a backup may set for itself: everything except the three fields that name
+# the seat. A backup does not get its own id, label or weight, because it is not
+# a participant — it is the same participant, reached down a different wire, and
+# a council that let it carry its own weight would be weighing one opinion twice
+# depending on which endpoint happened to be up.
+_BACKUP_FIELDS = _MEMBER_FIELDS - {"id", "label", "weight"}
+
+# What a backup takes from the seat when it does not say otherwise: everything
+# the seat settled about the *model* — which one, how many tokens, how patient
+# to be, whether it can see — so that the ordinary case, the same model on a
+# second relay, costs one line of config.
+#
+# Three things never come down from the seat. `base_url`, `api_key` and `format`
+# are the entire point of having a backup. `headers` is excluded for the reason
+# `api_key` is: a header written for one endpoint is routinely a credential for
+# it, and a backup is by definition a different host. And `proxy` is excluded
+# because it is a fact about reaching that host rather than about the seat — a
+# seat pinned `proxy: false` for an internal gateway would otherwise hand that
+# down to a public backup, which is exactly the one that does need the proxy. A
+# backup takes its route from its own provider, or from the council's default.
+_SEAT_INHERITED = (_MEMBER_FIELDS - _ATOMIC_CONNECTION
+                   - {"headers", "proxy", "id", "label"})
 
 
 # --------------------------------------------------------------------------- #
@@ -238,6 +273,14 @@ class Member:
     # all. Whichever loader built this member collects it into the council's
     # warnings, so both configuration sources report the problem the same way.
     proxy_note: str = ""
+    # Other connections that can answer for this seat, in the order they will be
+    # tried when the one before them does not. Each is a whole Member — the same
+    # id, label and weight, its own endpoint and its own model — so everything
+    # that already knows how to call a member calls a backup unchanged.
+    #
+    # A backup carries no backups of its own: the chain is this one list, in
+    # order, and nesting it would only hide the order it is read in.
+    backups: list[Member] = field(default_factory=list)
     enabled: bool = True
     disabled_reason: str = ""
     # A seat the caller supplied an answer for, rather than one this server
@@ -266,13 +309,39 @@ class Member:
             self.disabled_reason = self.disabled_reason or "its proxy cannot be used"
 
     @property
+    def sources(self) -> list[Member]:
+        """Every connection this seat may answer through, in the order tried.
+
+        The seat itself is the first of them, which is what keeps a member with
+        no backups exactly as it was: a one-element chain.
+        """
+        return [self] + [b for b in self.backups if b.enabled]
+
+    @property
     def configured(self) -> bool:
-        return not self.missing
+        """Whether this seat can be called at all — through any of its sources.
+
+        A primary missing its key is no longer the end of the seat if a backup
+        behind it is complete. `list_council` prints the chain source by source,
+        so the incomplete one is still visible rather than merely tolerated.
+        """
+        return any(not s.missing for s in self.sources)
+
+    @property
+    def sees_images(self) -> bool:
+        """Whether any source of this seat can be shown an image.
+
+        Asked of the seat, not of one connection: a seat whose primary is blind
+        and whose backup is not can still take the call, and `ask_member` sends
+        it down the source that can see.
+        """
+        return any(s.vision for s in self.sources)
 
     @property
     def missing(self) -> list[str]:
         # A guest arrives with its answer already given, so there is nothing to
-        # connect to and nothing that could be missing.
+        # connect to and nothing that could be missing. This asks only about
+        # this one connection — `configured` is the question about the seat.
         if self.guest:
             return []
         return [f for f in ("base_url", "api_key", "model") if not getattr(self, f)]
@@ -423,6 +492,87 @@ def _uncommented(raw: dict) -> dict:
     return {k: v for k, v in raw.items() if not k.startswith("$")}
 
 
+def _read_backups(entries, seat_id: str, seat: dict, providers: dict[str, dict],
+                  fallback: dict, warnings: list[str]) -> list[Member]:
+    """Read a member's `backups` into further connections for the same seat.
+
+    Each one is resolved in three passes, nearest statement last: what the seat
+    settled, then what the backup's own provider says, then what the backup sets
+    itself. The connection is the one thing that never comes down from the seat
+    — a backup exists precisely to be somewhere else — so a backup either names
+    a provider and takes all three fields from it, or brings all three itself.
+
+    Nothing here decides *when* a seat falls through to one of these; that is
+    `ask_member`'s job. This only settles what each of them is.
+    """
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        warnings.append(f"member '{seat_id}': 'backups' must be a list of connections, "
+                        f"in the order they should be tried — ignored")
+        return []
+
+    inherited = {k: v for k, v in seat.items() if k in _SEAT_INHERITED}
+    label = seat.get("label") or seat_id
+    out: list[Member] = []
+    for n, entry in enumerate(entries, start=1):
+        who = f"member '{seat_id}' backup {n}"
+        if len(out) >= _MAX_BACKUPS:
+            warnings.append(f"member '{seat_id}': only the first {_MAX_BACKUPS} backups are "
+                            f"used, so backup {n} onwards was dropped")
+            break
+        if not isinstance(entry, dict):
+            warnings.append(f"{who}: not an object — ignored")
+            continue
+        entry = _uncommented(entry)
+
+        named = sorted(set(entry) & {"id", "label", "weight"})
+        if named:
+            warnings.append(f"{who}: ignored {named} — a backup is the same seat reached "
+                            f"another way, so it answers as '{seat_id}', under the seat's "
+                            f"label and at the seat's weight")
+        if "backups" in entry:
+            warnings.append(f"{who}: ignored 'backups' — they do not nest. Put every "
+                            f"connection for this seat in one list, in the order to try them")
+        unknown = set(entry) - _BACKUP_FIELDS - {"provider", "id", "label", "weight", "backups"}
+        if unknown:
+            warnings.append(f"{who}: ignored unknown field(s) {sorted(unknown)}")
+
+        provider_name = entry.get("provider")
+        if provider_name and provider_name not in providers:
+            warnings.append(f"{who}: unknown provider '{provider_name}'")
+
+        base = dict(inherited)
+        mixed = sorted(set(entry) & _ATOMIC_CONNECTION) if provider_name else []
+        if mixed:
+            warnings.append(
+                f"{who}: disabled — it uses provider '{provider_name}' but also sets {mixed}. "
+                f"base_url, api_key and format are one unit here for the same reason they are "
+                f"on a member: overriding part of them would send '{provider_name}' "
+                f"credentials to a host they were not issued for. Either drop {mixed}, or "
+                f"remove 'provider' and give this backup its own complete connection.")
+            base["enabled"] = False
+            base["disabled_reason"] = "mixes a provider's connection with its own"
+        else:
+            base.update(providers.get(provider_name, {}) if provider_name else {})
+            for k, v in fallback.items():
+                base.setdefault(k, v)
+            base.update({k: v for k, v in entry.items() if k in _BACKUP_FIELDS})
+
+        # The seat's identity, not one of its own: this is where the answer gets
+        # credited, and crediting it anywhere else would put a second voice in
+        # the room. The suffix is for the places a source has to be named one by
+        # one — `list_council`'s table, and the report of what a failed seat tried.
+        base["id"] = f"{seat_id}#{n}"
+        base["label"] = label
+        m = Member(**base)
+        if m.enabled and m.missing:
+            warnings.append(f"{who}: incomplete (missing {', '.join(m.missing)}) — this seat "
+                            f"will skip past it rather than call it")
+        out.append(m)
+    return out
+
+
 def _from_file(path: Path) -> Council:
     warnings: list[str] = []
     data = _expand(json.loads(path.read_text(encoding="utf-8")))
@@ -446,7 +596,7 @@ def _from_file(path: Path) -> Council:
         provider_name = raw.get("provider")
         if provider_name and provider_name not in providers:
             warnings.append(f"member '{member_id}': unknown provider '{provider_name}'")
-        unknown = set(raw) - _MEMBER_FIELDS - {"provider"}
+        unknown = set(raw) - _MEMBER_FIELDS - {"provider", "backups"}
         if unknown:
             warnings.append(f"member '{member_id}': ignored unknown field(s) {sorted(unknown)}")
 
@@ -471,6 +621,10 @@ def _from_file(path: Path) -> Council:
             for k, v in fallback.items():
                 base.setdefault(k, v)
             base.update({k: v for k, v in raw.items() if k in _MEMBER_FIELDS})
+
+        # Read after the seat is settled, because a backup fills its gaps from it.
+        base["backups"] = _read_backups(raw.get("backups"), member_id, base, providers,
+                                        fallback, warnings)
 
         if member_id in members:
             warnings.append(f"duplicate member id '{member_id}' — later one wins")

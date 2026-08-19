@@ -5,16 +5,17 @@ Completions format (`POST {base_url}/chat/completions`) and the Anthropic
 Messages format (`POST {base_url}/v1/messages`).
 
 A call that fails for a transient reason is retried; one that fails for a
-permanent reason is not. What survives that is returned as readable text rather
-than raised, so one unreachable member degrades the answer instead of killing
-the whole call.
+permanent reason is not. A seat that lists backups then tries the next of them,
+and so on down its chain. What survives all of that is returned as readable text
+rather than raised, so one unreachable member degrades the answer instead of
+killing the whole call.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -69,9 +70,34 @@ class Answer:
     # end. The text is real and worth reading, so `ok` stays true; this is what
     # lets a caller notice that a member was cut off without parsing the note.
     truncated: bool = False
+    # Which of the seat's connections produced this. The seat itself when it
+    # answered on its primary, one of its backups when it did not, and None for
+    # a guest, which was never called at all.
+    source: Member | None = None
+    # The bare failure reason, without the label wrapped around it. `text` is
+    # what a reader sees; this is what a chain report is built out of.
+    detail: str = ""
+    # The connections that were tried, or skipped, before this answer — one line
+    # each, in the order the chain was walked. Empty on the ordinary path.
+    passed_over: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:
         return self.text
+
+    @property
+    def backup_rank(self) -> int:
+        """Which of the seat's backups answered, counting from 1.
+
+        0 when the primary answered, which is also the answer for every seat
+        that has no backups — so a caller can read this without first asking
+        whether the feature is in use.
+        """
+        if self.source is None or self.source is self.member:
+            return 0
+        for n, b in enumerate(self.member.backups, start=1):
+            if b is self.source:
+                return n
+        return 0
 
 
 class BadPayload(Exception):
@@ -121,6 +147,16 @@ def _proxy_hint(m: Member) -> str:
     return (f" — note {var}={redact_proxy(val)} is set in this server's environment "
             f"and this member follows it; if the endpoint is not reachable through "
             f'that proxy (an internal host, typically), give the member `"proxy": false`')
+
+
+def _where(s: Member) -> str:
+    """One connection, named the way a reader can act on it.
+
+    The model belongs in it as much as the host does: two connections for one
+    seat routinely carry the same model under different ids, and a chain report
+    that named only hosts would not show which id was actually refused.
+    """
+    return f"{s.model or '(no model)'} at {s.base_url or '(no endpoint)'}"
 
 
 # --------------------------------------------------------------------------- #
@@ -270,16 +306,15 @@ def _backoff(attempt: int, base: float) -> float:
     return window / 2 + random.uniform(0, window / 2)
 
 
-async def ask_member(m: Member, prompt: str, system: str | None = None,
-                     docs: list[Loaded] | None = None) -> Answer:
-    """Send one prompt to one member, retrying transient failures, never raising."""
-    if not m.configured:
-        return Answer(m, f"[{m.label} is not configured — missing {', '.join(m.missing)}. "
-                         f"See the server's README for how to configure a council member.]",
-                      ok=False, attempts=0)
+async def _ask_one(m: Member, prompt: str, system: str | None,
+                   docs: list[Loaded]) -> Answer:
+    """One prompt down exactly one connection, retrying transient failures.
 
+    Knows nothing about backups: it is handed a connection and reports what
+    came back. `ask_member` is what decides whether a failure here is the end
+    of the seat or the cue to try the next way in.
+    """
     call = _call_anthropic if m.format == "anthropic" else _call_openai
-    docs = docs or []
     attempts = m.retries + 1
     attempt = 0
     detail = ""
@@ -295,7 +330,8 @@ async def ask_member(m: Member, prompt: str, system: str | None = None,
             # weigh it.
             if cut:
                 text += f"\n\n[cut off — {cut}, so this answer is incomplete]"
-            return Answer(m, text, ok=True, attempts=attempt, truncated=bool(cut))
+            return Answer(m, text, ok=True, attempts=attempt, truncated=bool(cut),
+                          source=m)
         except httpx.HTTPStatusError as e:
             detail = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
             if e.response.status_code not in _RETRYABLE_STATUS:
@@ -320,7 +356,70 @@ async def ask_member(m: Member, prompt: str, system: str | None = None,
             await asyncio.sleep(_backoff(attempt, m.retry_backoff) if wait is None else wait)
 
     tried = f" (gave up after {attempt} attempts)" if attempt > 1 else ""
-    return Answer(m, f"[{m.label} {detail}{tried}]", ok=False, attempts=attempt)
+    return Answer(m, f"[{m.label} {detail}{tried}]", ok=False, attempts=attempt,
+                  source=m, detail=f"{detail}{tried}")
+
+
+async def ask_member(m: Member, prompt: str, system: str | None = None,
+                     docs: list[Loaded] | None = None) -> Answer:
+    """Send one prompt to one seat, down the first of its connections that answers.
+
+    A seat with no backups is a chain of one and behaves exactly as it always
+    has. With backups, each is tried in turn — after the one before it has spent
+    its own retries — and the first real answer ends the search. Which
+    connection produced it travels back on the Answer, because a backup may be
+    running a different model than the primary, and a council is a comparison of
+    models: a seat that quietly answers as something else is worse than a seat
+    that fails, since nothing in the text would give it away.
+
+    Falling through is deliberately not restricted to connection failures. A key
+    that was revoked, a model id the relay stopped carrying, a gateway answering
+    200 with something that is not an answer — from the seat's point of view
+    these are one event: this way in is not currently a way to that model, and
+    the config named another. The reasons are not thrown away; every one of them
+    comes back with the answer, or in place of it.
+    """
+    docs = docs or []
+    carries_image = any(d.is_image for d in docs)
+
+    trail: list[str] = []          # what each connection, in order, had to say
+    last: Answer | None = None
+    spent = 0
+    for s in m.sources:
+        if s.missing:
+            trail.append(f"{_where(s)}: not configured — missing {', '.join(s.missing)}")
+            continue
+        # A blind connection is skipped rather than shown the text alone: the
+        # seat has another way to the image, or it has none, and either is
+        # better than an answer written about material it never received.
+        if carries_image and not s.vision:
+            trail.append(f"{_where(s)}: set `vision: false`, and this call carries an image")
+            continue
+        last = await _ask_one(s, prompt, system, docs)
+        spent += last.attempts
+        if last.ok:
+            return replace(last, member=m, source=s, passed_over=list(trail))
+        trail.append(f"{_where(s)}: {last.detail}")
+
+    # Nothing answered. With one connection, the message it already wrote is the
+    # whole story; with several, no single one of them is.
+    if len(m.sources) == 1:
+        if last is not None:
+            return replace(last, member=m, source=m)
+        if m.missing:
+            return Answer(m, f"[{m.label} is not configured — missing "
+                             f"{', '.join(m.missing)}. See the server's README for how to "
+                             f"configure a council member.]",
+                          ok=False, attempts=0, source=m, passed_over=trail)
+        # Complete, and still never called: the one thing left that skips a
+        # connection is an image it is configured not to be shown.
+        return Answer(m, f"[{m.label} was not asked — {trail[0]}]", ok=False, attempts=0,
+                      source=m, passed_over=trail)
+
+    listed = "\n".join(f"  {n}. {t}" for n, t in enumerate(trail, start=1))
+    return Answer(m, f"[{m.label} has {len(m.sources)} connections configured and none of "
+                     f"them answered:\n{listed}]",
+                  ok=False, attempts=spent, passed_over=trail)
 
 
 async def probe_member(m: Member) -> str:

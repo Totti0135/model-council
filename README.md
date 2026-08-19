@@ -266,7 +266,8 @@ quota to be told the same thing. Defaults to 2 retries; set `retries: 0` for the
 old single-shot behaviour.
 
 A member that exhausts its attempts returns its error as that member's answer,
-so the rest of the council still answers.
+so the rest of the council still answers — unless it has somewhere else to go,
+in which case it goes there. See [Backups](#backups).
 
 ## Install
 
@@ -543,6 +544,7 @@ The first three travel together as one unit — see the rule above.
 | `vision` | member | `false` for a model that cannot be shown an image. It then sits out calls carrying one, rather than answering about the text alone. Default `true` |
 | `cache` | provider, member | `false` stops the `cache_control` breakpoint being sent with material. Anthropic format only; turn it off for a gateway that rejects the field. Default `true` |
 | `enabled` | member | `false` parks a member without deleting its config |
+| `backups` | member | Further endpoints for the same seat, tried in order when the one before them does not answer. Max 4. See [Backups](#backups) |
 
 `timeout`, `retries`, `retry_backoff` and `proxy` can also be set at the top level
 of the config file, as the default every member inherits.
@@ -583,6 +585,79 @@ answers and not their standing. The weights are for whoever reads the transcript
 and they are a prior, not a vote: they break ties and decide who carries the
 burden of proof. A specific, checkable reason from the lowest weight still beats
 a bare assertion from the highest.
+
+### Backups
+
+The same model is often reachable through more than one channel — a company
+gateway, a public relay, a spare key. Listing each as its own member is the wrong
+shape: it puts one model in the room several times, so it answers several times,
+is weighed several times, and in round two argues with itself.
+
+`backups` are further endpoints for the *same seat*, tried in order when the one
+before them does not answer:
+
+```json
+{
+  "id": "sol", "provider": "internal", "model": "gpt-5-codex", "label": "Codex",
+  "backups": [
+    { "provider": "my-relay" },
+    { "base_url": "https://another-relay.example/v1", "api_key": "${SPARE_KEY}",
+      "model": "gpt-5-codex-latest" }
+  ]
+}
+```
+
+One id, one label, one weight, one vote. You never address a backup — 
+`ask(model="sol")` reaches whichever of the three is up.
+
+A backup inherits what the seat settled about the model — `model`, `max_tokens`,
+`temperature`, `vision`, `timeout`, `retries` — so the ordinary case, the same
+model on a second relay, is the one line above. Name `model` only when the other
+channel calls it something else. Three things are never inherited:
+
+- **the connection** (`base_url`, `api_key`, `format`) — that is the point of a
+  backup. It either names a `provider` and takes all three from it, or brings all
+  three itself. Half of each is refused, for the reason in [A config file](#a-config-file).
+- **`headers`** — a header written for one endpoint is routinely a credential for it.
+- **`proxy`** — the route belongs to the host, not to the seat. A seat pinned
+  `proxy: false` for an internal gateway would otherwise send its public backups
+  around the very proxy they need. A backup takes its route from its own provider,
+  or from the council's default.
+
+**When a seat falls through.** Not only on a dead connection: a revoked key, a
+model id the relay stopped carrying, a gateway answering `200` with something
+that is not an answer. From the seat's point of view these are one event — this
+way in is not currently a way to that model, and the config named another.
+Transient failures ([Retries](#retries)) are still retried on the connection they
+happened on first, so a backup is for an endpoint that is *out*, not one that is
+slow to say yes. Put `retries: 0` on the primary if you would rather fail over
+than wait.
+
+**Which endpoint answered is printed with the answer.** A backup is frequently a
+different model id and sometimes a different model, and a council read as a
+comparison of models must not quietly compare something else:
+
+```
+===== Codex (gpt-5-codex-latest — backup 2, after the primary did not answer) =====
+```
+
+`list_council` shows the chain indented under each seat:
+
+```
+id            label        model        format  route   endpoint                       tries     status
+sol           Codex        gpt-5-codex  openai  direct  https://gateway.internal/v1    3 × 180s  ready
+  ↳ backup 1               gpt-5-codex  openai  env     https://your-relay/v1          3 × 180s  standing by
+  ↳ backup 2               gpt-5-c...   openai  env     https://another-relay/v1       3 × 180s  standing by
+```
+
+`probe_models` probes every link, so a backup that has quietly stopped carrying
+its model is visible before the day it is needed. A seat where nothing answered
+reports each connection it tried and why.
+
+Backups are a config-file feature; the environment-variable roster has no
+equivalent. Max 4 per seat — a seat is one model's opinion, not a
+high-availability cluster, and `ask_all` waits on the slowest chain to finish
+failing.
 
 ### Proxies
 

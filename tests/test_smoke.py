@@ -1030,10 +1030,14 @@ def test_shipped_example_is_valid() -> None:
         print("--  skipped shipped-example check (examples/ not present)")
         return
     with env(COUNCIL_CONFIG=str(example), MY_RELAY_KEY="sk-a", GLM_KEY="sk-g",
-             KIMI_KEY="sk-k", INTERNAL_KEY="sk-i"):
+             KIMI_KEY="sk-k", INTERNAL_KEY="sk-i", SPARE_KEY="sk-s"):
         c = cfg.load_council()
     assert not c.warnings, c.warnings
-    assert c.ids == ["gpt5", "codex", "glm", "small", "kimi", "inhouse"], c.ids  # 'spare' is off
+    assert c.ids == ["gpt5", "codex", "glm", "small", "sol", "kimi",
+                     "inhouse"], c.ids            # 'spare' is off, and a backup is not an id
+    sol = c.members["sol"]
+    assert [b.model for b in sol.backups] == ["gpt-5-codex", "gpt-5-codex-latest"]
+    assert sol.proxy is False and all(b.proxy is None for b in sol.backups)
     assert all(c.members[i].configured for i in c.ids), c.members
     assert c.members["inhouse"].proxy is False        # inherited from its provider
     assert c.members["kimi"].proxy == "http://127.0.0.1:7890"   # its own route
@@ -1457,6 +1461,274 @@ async def test_revision_prompt_points_at_the_material() -> None:
     print("ok  revision_prompt (material is named for the seat, not pasted back)")
 
 
+def test_backups_are_the_same_seat() -> None:
+    """A backup inherits the seat, keeps the seat's identity, and stays in order."""
+    doc = {
+        "timeout": 90,
+        "providers": {
+            "primary": {"base_url": "https://one/v1", "api_key": "k1", "format": "openai",
+                        "proxy": False,
+                        "headers": {"X-Token": "issued-for-one-host-only"}},
+            "spare": {"base_url": "https://two/v1", "api_key": "k2", "format": "anthropic"},
+        },
+        "members": [
+            {"id": "sol", "provider": "primary", "model": "gpt-5.6-sol",
+             "label": "GPT-5.6-sol", "weight": 2, "temperature": 0.2, "retries": 0,
+             "backups": [
+                 {"provider": "spare"},
+                 {"base_url": "https://three/v1", "api_key": "k3",
+                  "model": "gpt-5-codex", "timeout": 30},
+             ]},
+            {"id": "plain", "provider": "primary", "model": "m"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    assert not c.warnings, c.warnings
+    # Backups are not members: the roster is still the two seats that were listed,
+    # and nothing can address a backup directly or count it as a second opinion.
+    assert sorted(c.members) == ["plain", "sol"], sorted(c.members)
+    assert c.members["plain"].backups == []
+    assert c.members["plain"].sources == [c.members["plain"]]
+
+    sol = c.members["sol"]
+    one, two = sol.backups
+    assert sol.sources == [sol, one, two]
+
+    # The connection comes from the backup's own provider, never from the seat.
+    assert (one.base_url, one.api_key, one.format) == ("https://two/v1", "k2", "anthropic")
+    assert (two.base_url, two.api_key, two.format) == ("https://three/v1", "k3", "openai")
+
+    # Everything that is not the connection falls down from the seat, so the
+    # common case — the same model on another relay — is one line of config.
+    assert one.model == "gpt-5.6-sol" and one.temperature == 0.2 and one.retries == 0
+    assert one.timeout == 90                     # the seat's, from the file's default
+    assert two.model == "gpt-5-codex"            # unless the backup says otherwise
+    assert two.timeout == 30
+
+    # headers do not: a header written for one endpoint is routinely a credential
+    # for it, and a backup is by definition a different host.
+    assert sol.headers == {"X-Token": "issued-for-one-host-only"}
+    assert one.headers == {} and two.headers == {}, (one.headers, two.headers)
+
+    # Nor does the route. The seat here goes direct because its own gateway is
+    # somewhere a proxy cannot follow; handing that down would send the public
+    # backups — the ones most likely to need the proxy — around it too.
+    assert sol.proxy is False
+    assert one.proxy is None and two.proxy is None, (one.proxy, two.proxy)
+
+    # One seat, one voice: the label and weight the council reads are the seat's.
+    assert (one.label, two.label) == ("GPT-5.6-sol", "GPT-5.6-sol")
+    assert (one.weight, two.weight) == (2, 2)
+    assert (one.id, two.id) == ("sol#1", "sol#2")   # only so a chain can be named
+    print("ok  backups (inherit the seat, bring their own connection, keep its identity)")
+
+
+def test_a_backup_cannot_become_a_second_member() -> None:
+    """The ways a backup could quietly turn into something else are refused."""
+    doc = {
+        "providers": {
+            "a": {"base_url": "https://a/v1", "api_key": "ka"},
+            "b": {"base_url": "https://b/v1", "api_key": "kb"},
+        },
+        "members": [
+            {"id": "renamed", "provider": "a", "model": "m",
+             "backups": [{"provider": "b", "id": "other", "label": "Other", "weight": 9}]},
+            {"id": "mixed", "provider": "a", "model": "m",
+             "backups": [{"provider": "b", "api_key": "${SOMEWHERE_ELSE}"}]},
+            {"id": "nested", "provider": "a", "model": "m",
+             "backups": [{"provider": "b", "backups": [{"provider": "a"}]}]},
+            {"id": "greedy", "provider": "a", "model": "m",
+             "backups": [{"provider": "b"}] * 7},
+            {"id": "halfway", "provider": "a", "model": "m",
+             "backups": [{"base_url": "https://c/v1"}]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "config.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with env(COUNCIL_CONFIG=str(path)):
+            c = cfg.load_council()
+
+    def warned(*words: str) -> bool:
+        return any(all(w in x for w in words) for x in c.warnings)
+
+    # A backup that tried to name itself is still the seat, and is told so.
+    renamed = c.members["renamed"].backups[0]
+    assert (renamed.id, renamed.label, renamed.weight) == ("renamed#1", "renamed", 1.0)
+    assert warned("renamed", "'id'", "'label'", "'weight'"), c.warnings
+
+    # The atomic-connection rule holds one level down, for the same reason: half
+    # of provider 'b' and half of somewhere else sends b's host a key it never
+    # issued. A backup that does it is parked, not merged.
+    parked = c.members["mixed"].backups[0]
+    assert not parked.enabled and parked.disabled_reason
+    assert c.members["mixed"].sources == [c.members["mixed"]], "a parked backup is not tried"
+    assert warned("mixed", "api_key"), c.warnings
+
+    # A chain is one list read top to bottom; nesting would hide that order.
+    assert c.members["nested"].backups[0].backups == []
+    assert warned("nested", "do not nest"), c.warnings
+
+    assert len(c.members["greedy"].backups) == cfg._MAX_BACKUPS
+    assert warned("greedy", "dropped"), c.warnings
+
+    # An incomplete backup is kept and reported rather than silently dropped: it
+    # is a seat that looks two-deep and is one, which is worth saying out loud.
+    assert c.members["halfway"].backups[0].missing == ["api_key"]
+    assert warned("halfway", "incomplete", "api_key"), c.warnings
+    print("ok  a backup cannot rename itself, split a connection, nest, or pile up")
+
+
+@contextmanager
+def serving_hosts(**by_host):
+    """Serve a different outcome per host, and record the hosts actually called.
+
+    A chain is only testable if the two ends can be told apart, which is what
+    dispatching on the host buys: the recorded list is the order the seat walked
+    its connections in.
+    """
+    from model_council import providers as p
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        seen.append(host)
+        return by_host[host]()
+
+    saved = p._client
+    p._client = lambda m, timeout=None: httpx.AsyncClient(
+        transport=httpx.MockTransport(handler))
+    try:
+        yield seen
+    finally:
+        p._client = saved
+
+
+def _seat(**kw) -> cfg.Member:
+    """A seat on 'one', backed by 'two' and then 'three'."""
+    def conn(i: str, host: str, model: str) -> cfg.Member:
+        return cfg.Member(id=i, label="Sol", model=model, api_key="k",
+                          base_url=f"https://{host}/v1", retry_backoff=0)
+    return cfg.Member(id="sol", label="Sol", model="gpt-5.6-sol", api_key="k",
+                      base_url="https://one/v1", retry_backoff=0,
+                      backups=[conn("sol#1", "two", "gpt-5.6-sol"),
+                               conn("sol#2", "three", "gpt-5-codex")],
+                      **kw)
+
+
+async def test_a_seat_falls_through_to_its_backups() -> None:
+    """The next connection is tried when the one before it does not answer."""
+    from model_council import server as srv
+    from model_council.providers import ask_member
+
+    # Nothing changes for a seat whose primary works: the backups are not called,
+    # and the answer is not dressed up as having survived anything.
+    with serving_hosts(one=_ok, two=_ok, three=_ok) as seen:
+        a = await ask_member(_seat(), "hi")
+    assert a.ok and seen == ["one"], (a, seen)
+    assert a.backup_rank == 0 and a.source is a.member
+    assert "backup" not in srv._labelled(a, False), srv._labelled(a, False)
+
+    # A primary that is merely busy spends its own retries first — a backup is
+    # for a connection that is out, not for one that is slow to say yes.
+    with serving_hosts(one=_status(503), two=_ok, three=_ok) as seen:
+        a = await ask_member(_seat(), "hi")
+    assert a.ok and seen == ["one", "one", "one", "two"], seen
+    assert a.backup_rank == 1 and a.source.base_url == "https://two/v1"
+
+    # A revoked key is not retried and not fatal either: it is this way in being
+    # shut, which is exactly what the next way in is for.
+    with serving_hosts(one=_status(401), two=_ok, three=_ok) as seen:
+        a = await ask_member(_seat(), "hi")
+    assert a.ok and seen == ["one", "two"], seen
+
+    # Which model actually spoke reaches the reader. The backup here carries a
+    # different model id, and a council is a comparison of models.
+    with serving_hosts(one=_status(401), two=_status(404), three=_ok) as seen:
+        a = await ask_member(_seat(), "hi")
+    assert a.ok and a.backup_rank == 2 and seen == ["one", "two", "three"], (a, seen)
+    header = srv._labelled(a, False)
+    assert "gpt-5-codex" in header and "backup 2" in header, header
+
+    # retries=0 on the primary is the fail-fast shape: one attempt, then over.
+    with serving_hosts(one=_status(503), two=_ok, three=_ok) as seen:
+        a = await ask_member(_seat(retries=0), "hi")
+    assert a.ok and seen == ["one", "two"], seen
+
+    # A parked backup is not a connection.
+    seat = _seat()
+    seat.backups[0].enabled = False
+    with serving_hosts(one=_status(401), two=_ok, three=_ok) as seen:
+        a = await ask_member(seat, "hi")
+    assert a.ok and seen == ["one", "three"], seen
+
+    # `ask` hands back the answer and nothing else — there is no header to carry
+    # the substitution, so it goes in front of the text or nowhere at all.
+    saved = srv.COUNCIL
+    try:
+        srv.COUNCIL = cfg.Council({"sol": _seat()}, "test")
+        with serving_hosts(one=_status(401), two=_ok, three=_ok):
+            out = await srv.ask("sol", "hi")
+        assert out.startswith("[answered by Sol's backup 1"), out
+        assert "https://two/v1" in out and out.endswith("pong"), out
+
+        with serving_hosts(one=_ok, two=_ok, three=_ok):
+            assert await srv.ask("sol", "hi") == "pong", "a working primary says nothing"
+    finally:
+        srv.COUNCIL = saved
+    print("ok  fallover (only when a connection is out, in order, and reported)")
+
+
+async def test_a_seat_that_is_wholly_down_says_what_it_tried() -> None:
+    """With every way in shut, no single failure is the story — so all of them are."""
+    from model_council.providers import ask_member
+
+    # Retries belong to the connection, not to the seat: each of the three gets
+    # its own budget, so the chain is flattened here to make the order readable.
+    seat = _seat(retries=0)
+    for b in seat.backups:
+        b.retries = 0
+    with serving_hosts(one=_status(500), two=_status(401), three=_boom()) as seen:
+        a = await ask_member(seat, "hi")
+    assert not a.ok, a
+    assert seen == ["one", "two", "three"], seen
+    assert a.attempts == 3, a.attempts        # what the seat spent, across them all
+    # Each line names the model and the host, because two connections for one
+    # seat routinely differ in both and a reader has to know which was refused.
+    assert "3 connections" in a.text, a.text
+    for fragment in ("gpt-5.6-sol at https://one/v1", "HTTP 500",
+                     "gpt-5.6-sol at https://two/v1", "HTTP 401",
+                     "gpt-5-codex at https://three/v1", "ConnectError"):
+        assert fragment in a.text, (fragment, a.text)
+
+    # A seat with no backups keeps the message it always had: a chain of one
+    # reported as a chain would be ceremony around a single sentence.
+    plain = cfg.Member(id="x", label="X", model="m", base_url="https://one/v1",
+                       api_key="k", retry_backoff=0, retries=0)
+    with serving_hosts(one=_status(500)):
+        a = await ask_member(plain, "hi")
+    assert not a.ok and a.text.startswith("[X HTTP 500"), a.text
+    assert "connections" not in a.text, a.text
+
+    # An incomplete connection is skipped rather than called, and the skip is
+    # reported alongside the failures — a seat that looks two-deep and is one.
+    half = cfg.Member(id="y", label="Y", model="m", base_url="https://one/v1",
+                      api_key="k", retry_backoff=0, retries=0,
+                      backups=[cfg.Member(id="y#1", label="Y", model="m",
+                                          base_url="https://two/v1")])
+    with serving_hosts(one=_status(500)) as seen:
+        a = await ask_member(half, "hi")
+    assert seen == ["one"], "an unconfigured backup must not be dialled"
+    assert "not configured — missing api_key" in a.text, a.text
+    print("ok  a seat with nothing left reports every connection it tried")
+
+
 def main() -> None:
     test_default_roster()
     test_env_roster()
@@ -1468,6 +1740,8 @@ def main() -> None:
     asyncio.run(test_the_route_is_visible())
     test_retry_settings()
     test_weights()
+    test_backups_are_the_same_seat()
+    test_a_backup_cannot_become_a_second_member()
     test_registry_metadata_agrees()
     test_explicit_beats_discovered()
     test_shipped_example_is_valid()
@@ -1476,6 +1750,8 @@ def main() -> None:
     test_http_refuses_to_serve_the_world()
     asyncio.run(test_http_gate())
     asyncio.run(test_retry_transport())
+    asyncio.run(test_a_seat_falls_through_to_its_backups())
+    asyncio.run(test_a_seat_that_is_wholly_down_says_what_it_tried())
     test_material_loading()
     asyncio.run(test_material_reaches_the_wire())
     asyncio.run(test_truncation_is_not_silent())

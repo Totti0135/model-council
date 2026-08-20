@@ -2,13 +2,6 @@
 
 ## 0.12.0
 
-This release also carries 0.10.0 and 0.11.0, which were written but never
-published. Two features arrive with it: `materials` hands the council the
-document itself — a spec, a log, a screenshot — rather than whatever the caller
-managed to retype into the prompt, and the route out is now chosen per seat, with
-a council-wide default. Both have their own sections in
-[CHANGELOG.md](https://github.com/Totti0135/model-council/blob/main/CHANGELOG.md).
-
 **The council can be given a standing objection.** Everything this server did
 against convergence was defensive — the members are anonymous to each other,
 they are never told the weights, and the closing instruction tells them not to

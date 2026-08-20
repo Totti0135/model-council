@@ -762,9 +762,10 @@ async def test_the_steelman_argues_back_every_round() -> None:
         # The steelman call is the one carrying the adversarial instruction; it
         # goes to a member, so only the prompt tells the two apart.
         if "strongest case against" in prompt:
-            return Answer(m, f"objection {sum(1 for _, p in calls
-                                              if 'strongest case against' in p)}", ok=True)
-        return Answer(m, f"{m.label} round {sum(1 for i, _ in calls if i == m.id)}", ok=True)
+            nth = sum(1 for _, p in calls if "strongest case against" in p)
+            return Answer(m, f"objection {nth}", ok=True)
+        nth = sum(1 for i, _ in calls if i == m.id)
+        return Answer(m, f"{m.label} round {nth}", ok=True)
 
     saved = s.COUNCIL, s.ask_member
     try:

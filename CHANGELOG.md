@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.13.0
+
+**A seat can have more than one way in.** The same model is often reachable
+through two or three channels — a company gateway, a public relay, a spare key —
+and until now each of them had to be its own member. That is the wrong shape: it
+puts one model in the room three times, so it answers three times, gets weighed
+three times, and argues with itself in round two. The alternative was to pick one
+channel and accept that the seat is empty whenever that channel is down.
+
+A member may now list `backups`: further endpoints for the same seat, tried in
+order when the one before them does not answer.
+
+```json
+{
+  "id": "sol", "provider": "internal", "model": "gpt-5-codex", "label": "Codex",
+  "backups": [
+    { "provider": "my-relay" },
+    { "base_url": "https://another-relay.example/v1", "api_key": "${SPARE_KEY}",
+      "model": "gpt-5-codex-latest" }
+  ]
+}
+```
+
+It is still one seat: one id, one label, one weight, one vote. You never address
+a backup — `ask(model="sol")` reaches whichever of the three is up.
+
+A backup inherits everything the seat settled about the model — which one, how
+patient to be, whether it can see — so the ordinary case, the same model on a
+second relay, is the one line above. It never inherits the connection (that is
+the point), the `headers` (a header written for one endpoint is routinely a
+credential for it), or the `proxy` (a seat pinned `proxy: false` for an internal
+gateway would otherwise send its public backups around the proxy they need).
+
+Falling through is not restricted to connection failures. A revoked key, a model
+id the relay stopped carrying, a gateway answering `200` with something that is
+not an answer — from the seat's point of view these are one event: this way in is
+not currently a way to that model, and the config named another. Transient
+failures are still retried on the connection they happened on first, so a backup
+is for an endpoint that is out, not one that is slow to say yes.
+
+**Which endpoint answered is printed with the answer**, because a backup is
+frequently a different model id than the primary and sometimes a different model,
+and a council read as a comparison of models must not quietly compare something
+else:
+
+```
+===== Codex (gpt-5-codex-latest — backup 2, after the primary did not answer) =====
+```
+
+`list_council` shows each seat's chain indented beneath it, with the model and
+endpoint of every link; `probe_models` now probes all of them, so a backup that
+has quietly stopped carrying its model is visible before the day it is needed. A
+seat where nothing answered reports every connection it tried and why.
+
 ## 0.12.0
 
 **The council can be given a standing objection.** Everything this server did
@@ -45,6 +99,7 @@ and a transcript in which nobody engaged it is indistinguishable from one in
 which it was answered. From round 2 the members are told to take its strongest
 point explicitly: accept it, answer it, or say why it does not bear on the
 question. The instruction appears only when such a seat is actually at the table.
+
 
 ## 0.11.0
 

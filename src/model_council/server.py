@@ -146,7 +146,10 @@ def _with_eyes(members: list[Member], docs: list[Loaded]) -> tuple[list[Member],
     """
     if not any(d.is_image for d in docs):
         return members, []
-    return [m for m in members if m.vision], [m for m in members if not m.vision]
+    # Asked of the seat: one whose primary is blind but whose backup can see
+    # still takes the call, and `ask_member` sends it down the eye that works.
+    return ([m for m in members if m.sees_images],
+            [m for m in members if not m.sees_images])
 
 
 def _blind_note(blind: list[Member]) -> str:
@@ -193,11 +196,43 @@ def _route(m: Member) -> str:
     return "env" if env_proxy()[0] else "direct"
 
 
-def _origin(m: Member) -> str:
-    """What produced this answer, for its header."""
-    if m.steelman:
-        return f"argued on assignment, written by {m.model}"
-    return "supplied by the caller" if m.guest else m.model
+def _sources(m: Member) -> list[tuple[str, Member]]:
+    """This seat's connections, each with the name to print it under.
+
+    The primary carries no name of its own — it is the seat — and every backup
+    is numbered by its place in the configured list rather than by its place in
+    this one, so a parked backup does not renumber the ones after it.
+    """
+    return [("", m)] + [(f"backup {n}", b)
+                        for n, b in enumerate(m.backups, start=1) if b.enabled]
+
+
+def _origin(a: Answer) -> str:
+    """What produced this answer, for its header.
+
+    A seat that fell through to a backup says so here, and says which model
+    actually spoke. That is not bookkeeping: the backup is a different endpoint
+    and frequently a different model id, so a council read as a comparison of
+    models would otherwise be comparing something other than what it lists —
+    and nothing in the answer's own text would give that away.
+    """
+    # Before the guest check, because the steelman is seated as a guest and
+    # would otherwise be reported as something the caller supplied. It is the
+    # one seat this server writes rather than receives, and the header is where
+    # that is said.
+    if a.member.steelman:
+        # The connection that actually wrote it, which is not always the seat's
+        # primary: the writer may itself have fallen through to a backup, and a
+        # backup is frequently a different model id. Naming the primary here
+        # would reintroduce exactly the misattribution backups exist to prevent.
+        return f"argued on assignment, written by {(a.source or a.member).model}"
+    if a.member.guest:
+        return "supplied by the caller"
+    src = a.source or a.member
+    n = a.backup_rank
+    if not n:
+        return src.model
+    return f"{src.model} — backup {n}, after the primary did not answer"
 
 
 def _labelled(a: Answer, weighted: bool) -> str:
@@ -205,7 +240,7 @@ def _labelled(a: Answer, weighted: bool) -> str:
     # table carries one: it argues an assigned side, so a number saying how far
     # this council trusts it would be read as how far to trust the objection.
     tag = f" · weight {a.member.weight:g}" if weighted and not a.member.steelman else ""
-    return f"===== {a.member.label} ({_origin(a.member)}){tag} =====\n{a.text}"
+    return f"===== {a.member.label} ({_origin(a)}){tag} =====\n{a.text}"
 
 
 def _round_block(n: int, total: int, what: str, answers: list[Answer],
@@ -479,7 +514,16 @@ async def ask(model: ModelId, prompt: str, system: str | None = None,  # type: i
     seeing, blind = _with_eyes([m], docs)
     if not seeing:
         return _blind_note(blind)
-    return (await ask_member(m, prompt, system, docs)).text
+    a = await ask_member(m, prompt, system, docs)
+    # `ask` hands back the answer and nothing else, which is the whole point of
+    # it — but that leaves no header to carry the one fact the caller cannot
+    # recover from the text: that this came from somewhere other than the model
+    # the roster names. `ask_all` says it above each answer; here it goes first.
+    if a.ok and a.backup_rank:
+        return (f"[answered by {m.label}'s backup {a.backup_rank} — {a.source.model} at "
+                f"{a.source.base_url} — because the primary did not. `list_council` has "
+                f"the chain.]\n\n{a.text}")
+    return a.text
 
 
 @mcp.tool(description="""Ask several members the SAME prompt in parallel, returning
@@ -640,7 +684,8 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
         if speaking:
             # The objection is reseated under its own identity: the writer wrote
             # it, but at the table it is a position, not that member's opinion.
-            steel = Answer(seat, done_calls[-1].text, ok=done_calls[-1].ok)
+            steel = Answer(seat, done_calls[-1].text, ok=done_calls[-1].ok,
+                           source=done_calls[-1].source)
             # Only a round it actually spoke in. A failed call is not a seat that
             # said something, and the note below would otherwise account for a
             # round the reader cannot find in the transcript.
@@ -902,24 +947,50 @@ async def list_council() -> str:
     that member alone. It appears only when the members can differ; passwords in
     a proxy URL are masked.
 
+    A member may have `backups`: further endpoints for the same seat, indented
+    under it as `↳ backup 1`, `↳ backup 2` and tried in that order when the one
+    above does not answer. They are the same member — same id, same label, one
+    vote — so you never address a backup directly; the seat's id reaches
+    whichever of them is up. Read their `model` column: a backup is often the
+    same model under a different id, and sometimes not the same model at all,
+    and `ask_all` names the one that actually answered above each answer.
+
     Cheap and local — makes no network calls. Use this to find out which ids you
     may pass to `ask` and `ask_all`, or to explain a configuration problem.
     """
+    def _status(c: Member, standby: bool) -> str:
+        if not c.enabled:
+            return f"disabled — {c.disabled_reason}" if c.disabled_reason else "disabled"
+        if c.missing:
+            return f"missing {', '.join(c.missing)}"
+        return "standing by" if standby else "ready"
+
     rows = [("id", "label", "model", "weight", "format", "sees", "route", "endpoint",
              "tries", "status")]
+    every: list[Member] = []
     for m in COUNCIL.members.values():
-        status = "ready" if m.configured else f"missing {', '.join(m.missing)}"
-        if not m.enabled:
-            status = f"disabled — {m.disabled_reason}" if m.disabled_reason else "disabled"
-        rows.append((m.id, m.label, m.model or "-", f"{m.weight:g}", m.format,
-                     "text+img" if m.vision else "text", _route(m),
-                     m.base_url or "-", f"{m.retries + 1} × {m.timeout:g}s", status))
+        # Not `_sources`, which is the chain that would be *called*: a parked
+        # backup belongs in this table precisely because it is parked, and the
+        # question this table answers is what the configuration says.
+        #
+        # A backup borrows the seat's label and weight and does not reprint
+        # them: repeating them down the chain would read as several members.
+        for tag, c in [("", m)] + [(f"backup {n}", b)
+                                   for n, b in enumerate(m.backups, start=1)]:
+            every.append(c)
+            rows.append((m.id if not tag else f"  ↳ {tag}",
+                         m.label if not tag else "",
+                         c.model or "-",
+                         f"{m.weight:g}" if not tag else "",
+                         c.format, "text+img" if c.vision else "text", _route(c),
+                         c.base_url or "-", f"{c.retries + 1} × {c.timeout:g}s",
+                         _status(c, standby=bool(tag))))
 
     # The route column earns its width only when the routes can differ. With no
     # proxy configured anywhere and none in the environment, every member says
     # "direct" and the column is a wall of the same word.
     var, val = env_proxy()
-    if not var and all(m.proxy is None for m in COUNCIL.members.values()):
+    if not var and all(c.proxy is None for c in every):
         rows = [r[:6] + r[7:] for r in rows]
 
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
@@ -948,13 +1019,18 @@ async def probe_models(model: ModelId | None = None) -> str:  # type: ignore[val
         return _unknown(unknown) if unknown else "[no council members are configured]"
     lines: list[str] = []
     for m in members:
-        if not m.configured:
-            lines.append(f"{m.label}: not configured (missing {', '.join(m.missing)})")
-            continue
-        try:
-            lines.append(f"{m.label} (using: {m.model}) -> {await probe_member(m)}")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"{m.label}: [could not list models — {type(e).__name__}: {e}]")
+        # Every connection the seat would actually use, not just the primary: a
+        # backup that has quietly stopped carrying its model is invisible until
+        # the day the primary goes down and the seat needs it.
+        for tag, c in _sources(m):
+            who = f"{m.label} {tag}".strip()
+            if c.missing:
+                lines.append(f"{who}: not configured (missing {', '.join(c.missing)})")
+                continue
+            try:
+                lines.append(f"{who} (using: {c.model}) -> {await probe_member(c)}")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"{who}: [could not list models — {type(e).__name__}: {e}]")
     return "\n".join(lines)
 
 

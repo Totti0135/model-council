@@ -18,7 +18,7 @@ self-run gateway, a local server, or several of each.
 | Tool | What it does |
 |------|--------------|
 | `ask(model, prompt, materials?)` | Ask one member by id |
-| `ask_all(prompt, models?, rounds?, guests?, materials?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `guests` seats answers you already have; `materials` hands them a file to read |
+| `ask_all(prompt, models?, rounds?, guests?, materials?, steelman?)` | Ask everyone (or a named subset) the same prompt in parallel, answers side by side. `rounds=2` turns it into a discussion; `steelman` seats a standing objection that argues back every round; `guests` seats answers you already have; `materials` hands them a file to read |
 | `revise(prompt, answers, round?, materials?)` | Run one more round yourself: show the members everything said last round — including answers only you can produce — and get them back revised |
 | `revision_prompt(prompt, answers, seat, materials?)` | The prompt to hand your own seat for the next round, word-for-word what the members got. No network calls |
 | `list_council()` | The roster: ids, endpoints, weights, what each member can be shown, the route each takes out, call budget, and whether it is ready. No network calls |
@@ -122,6 +122,56 @@ transcript says so when you reach it.
 
 Members can also carry different [weights](#weights), for the common case where
 the council is not a council of equals.
+
+### The standing objection
+
+A council mostly agrees, and its agreement is the least informative thing it
+produces. Everything above works *against* convergence — the members are
+anonymous to each other, they are never told the weights, and the closing
+instruction tells them not to cave — but none of it creates any pressure to
+diverge. The strongest objection to a plan is not volunteered by members who
+think the plan is fine.
+
+`steelman` seats one:
+
+```
+ask_all(prompt, rounds=3, steelman={})
+```
+
+One member writes the strongest case against whatever the table has converged on,
+each round, and it goes back to everyone as an ordinary anonymous answer. In the
+next round they have to deal with it.
+
+**No member is told to argue a side it does not hold.** That is the line, and it
+is what separates this from a debate mode. What the members say is still what
+they think; the assignment lives in one extra call they are never told about.
+Handed a seat marked "arguing against", a model discounts the argument instead of
+answering it — so the provenance goes to you, in a note at the end of the
+transcript, and the argument goes to them.
+
+**It speaks every round, not once.** This is the part that looks like a detail
+and is not. An objection that cannot reply to its own rebuttal is *quoted* rather
+than represented: it cannot correct a misreading of itself, so by the third round
+the table is arguing with its paraphrase and calling that an answer. `tenure`
+buys fewer rounds than the default, and when the seat is retired early the
+transcript says it was retired by configuration — because an unexplained silence
+reads exactly like a position abandoned.
+
+The mirror of that is worth as much: the last thing the objection says is the
+last thing in the transcript, so nobody has been asked to take it on, and the
+transcript says that too. **An objection nobody answered is not a point that
+stood — it is a point that was never examined.** With `rounds=2` that is true of
+everything it said, which is why the note names the setting that fixes it rather
+than leaving you to notice after paying.
+
+Read what it produces as the strongest objection this council can make to order,
+never as evidence that anyone holds it. A point of its that survives being
+answered is worth something; the same point in the round it appeared is worth
+nothing yet.
+
+By default the first member being asked writes it, and also answers as itself —
+the two calls are unrelated as far as it knows. Name another with
+`steelman={"model": "glm"}`.
 
 ### Seating an answer you already have
 

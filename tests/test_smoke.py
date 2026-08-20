@@ -737,6 +737,172 @@ async def test_guests_join_the_argument() -> None:
     print("ok  guests (seated, shown to the members verbatim, and argued with)")
 
 
+async def test_the_steelman_argues_back_every_round() -> None:
+    """The standing objection is written per round, and answers its own rebuttal.
+
+    Three things are load-bearing and each fails silently on its own. It has to
+    speak *again* — an objection that cannot reply is quoted rather than
+    represented, and by round 3 the table is arguing with its paraphrase. The
+    members must not be told what it is, because a model that knows an argument
+    was commissioned discounts it instead of answering it. And when its tenure
+    ends early the transcript has to say so: a seat that goes quiet reads exactly
+    like a position abandoned.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str, label: str, **kw) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=label, **kw)
+
+    calls: list[tuple[str, str]] = []
+
+    async def answering(m, prompt, system=None, docs=None):
+        calls.append((m.id, prompt))
+        # The steelman call is the one carrying the adversarial instruction; it
+        # goes to a member, so only the prompt tells the two apart.
+        if "strongest case against" in prompt:
+            return Answer(m, f"objection {sum(1 for _, p in calls
+                                              if 'strongest case against' in p)}", ok=True)
+        return Answer(m, f"{m.label} round {sum(1 for i, _ in calls if i == m.id)}", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha"), "b": member("b", "Beta")}, "t")
+
+        out = await s.ask_all("Ship it?", rounds=3, steelman=s.Steelman())
+
+        # It spoke in rounds 2 and 3 — not once — and both objections are printed.
+        assert out.count("===== Steelman") == 2, out
+        assert "objection 1" in out and "objection 2" in out, out
+
+        # The second objection was written having been handed the first as its
+        # own, which is what makes it a revision rather than a fresh broadside.
+        steel_prompts = [p for _, p in calls if "strongest case against" in p]
+        assert len(steel_prompts) == 2, steel_prompts
+        assert "YOUR OWN ROUND-2 OBJECTION" in steel_prompts[1], steel_prompts[1]
+        assert "objection 1" in steel_prompts[1], steel_prompts[1]
+
+        # The members were shown it as a bare letter and told nothing about it.
+        member_prompts = [p for i, p in calls
+                          if i in ("a", "b") and "strongest case against" not in p]
+        r3 = [p for p in member_prompts if "round 3" in p or "ROUND-2 ANSWER" in p]
+        assert r3, member_prompts
+        assert any("objection 1" in p for p in r3), "the members never saw the objection"
+        for p in member_prompts:
+            for leak in ("steelman", "Steelman", "on assignment", "commissioned"):
+                assert leak not in p, f"the assignment leaked to a member: {leak}"
+
+        # The caller is told exactly what the members were not.
+        assert "STEELMAN — Steelman is not anyone's opinion" in out, out
+        assert "argued on assignment, written by m-a" in out, out
+        assert "= Steelman" in out, "the letter key does not name the seat"
+
+        # Its last objection is the last word, so nobody was asked to answer it.
+        # Unflagged that reads as a point that survived rather than one never
+        # tested, which is the more dangerous of the two misreadings.
+        assert "nothing above answers the round-3 objection" in out, out
+        assert "not a point that stood" in out, out
+
+        # At two rounds that is true of everything it said, and the note says so
+        # rather than leaving the caller to notice after paying.
+        calls.clear()
+        thin = await s.ask_all("q", rounds=2, steelman=s.Steelman())
+        assert "which here is all of it" in thin, thin
+        assert "rounds=3" in thin, thin
+
+        # A tenure shorter than the discussion retires it, and says why. The
+        # silence is the failure: unexplained, it reads as a concession.
+        calls.clear()
+        short = await s.ask_all("Ship it?", rounds=3, steelman=s.Steelman(tenure=1))
+        assert short.count("===== Steelman") == 1, short
+        assert "retired after round 2" in short, short
+        assert "not because it was answered" in short, short
+        # Retired, but still named in the key — the reader has to be able to
+        # place the letter it held two rounds ago.
+        assert "= Steelman" in short, short
+
+        # It sits last, so retiring it does not move anyone else's letter.
+        assert "A = Alpha, B = Beta" in short, short
+
+        # A named writer is used; one that is not being asked is a mistake worth
+        # naming rather than a silent fallback to somebody else.
+        calls.clear()
+        await s.ask_all("Ship it?", rounds=2, steelman=s.Steelman(model="b"))
+        assert [i for i, p in calls if "strongest case against" in p] == ["b"], calls
+        bad = await s.ask_all("q", rounds=2, steelman=s.Steelman(model="nope"))
+        assert "no member 'nope' is being asked" in bad, bad
+
+        # One round has nothing for it to argue against, and saying so beats
+        # returning a transcript with a seat the caller asked for missing from it.
+        solo = await s.ask_all("q", rounds=1, steelman=s.Steelman())
+        assert "nothing to argue against in a single round" in solo, solo
+
+        # Its weight is not printed even when the rest of the table carries one:
+        # a trust prior on an argument nobody holds reads as one on the argument.
+        calls.clear()
+        s.COUNCIL = cfg.Council({"a": member("a", "Alpha", weight=2),
+                                 "b": member("b", "Beta")}, "t")
+        ranked = await s.ask_all("q", rounds=2, steelman=s.Steelman())
+        assert "Steelman (argued on assignment" in ranked
+        assert "Steelman (argued on assignment, written by m-a) · weight" not in ranked, \
+            "the steelman was given a weight"
+        assert "Steelman" not in ranked.split("[WEIGHTS —")[1].split("]")[0], ranked
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  steelman (a standing objection that answers back, and retires out loud)")
+
+
+async def test_a_seat_that_cannot_revise_must_still_be_answered() -> None:
+    """Change 2: the members are told to address a non-revising seat, not pass it.
+
+    A guest will not restate itself, so a discussion drops it by default and the
+    transcript of that is indistinguishable from the transcript of it having been
+    answered. The instruction appears only when such a seat is on the table —
+    a rule about a seat that is not there is noise in every other prompt.
+    """
+    from model_council import server as s
+    from model_council.providers import Answer
+
+    def member(mid: str) -> cfg.Member:
+        return cfg.Member(id=mid, model=f"m-{mid}", base_url="https://h/v1",
+                          api_key="k", label=mid.title())
+
+    calls: list[tuple[str, str]] = []
+
+    async def answering(m, prompt, system=None, docs=None):
+        calls.append((m.id, prompt))
+        return Answer(m, f"{m.label} says so", ok=True)
+
+    saved = s.COUNCIL, s.ask_member
+    try:
+        s.ask_member = answering
+        s.COUNCIL = cfg.Council({"a": member("a"), "b": member("b")}, "t")
+
+        guest = s.Guest(label="Subagent", text="no rollback path")
+        await s.ask_all("q", rounds=2, guests=[guest])
+        for who, prompt in calls[2:]:
+            assert "not revising between rounds" in prompt, (who, prompt)
+            assert "passing over it is not the same as having answered it" in prompt, who
+
+        # No such seat, no such sentence.
+        calls.clear()
+        await s.ask_all("q", rounds=2)
+        for _, prompt in calls[2:]:
+            assert "Address its strongest point" not in prompt, prompt
+
+        # The steelman revises, so it is not covered by the rule — it can and
+        # does restate itself, and does not need the protection.
+        calls.clear()
+        await s.ask_all("q", rounds=2, steelman=s.Steelman())
+        for _, prompt in calls[2:]:
+            assert "not revising between rounds" not in prompt, prompt
+    finally:
+        s.COUNCIL, s.ask_member = saved
+    print("ok  a seat that cannot revise must still be answered (and only then)")
+
+
 async def test_revise_drives_a_round_from_outside() -> None:
     """One round, driven by the caller, so a voice only it can produce keeps up.
 
@@ -1485,6 +1651,8 @@ def main() -> None:
     asyncio.run(test_the_ceiling_is_on_the_call_not_the_discussion())
     asyncio.run(test_weights_reach_the_reader_not_the_members())
     asyncio.run(test_guests_join_the_argument())
+    asyncio.run(test_the_steelman_argues_back_every_round())
+    asyncio.run(test_a_seat_that_cannot_revise_must_still_be_answered())
     asyncio.run(test_revise_drives_a_round_from_outside())
     asyncio.run(test_revision_prompt_writes_for_the_seat_we_cannot_ask())
     asyncio.run(test_members_argue_with_letters_not_brands())

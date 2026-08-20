@@ -250,6 +250,12 @@ class Member:
     # described to the other members the same way: telling them a voice is
     # finished when it is about to answer back misrepresents the discussion.
     revises: bool = True
+    # A seat this server writes rather than polls for an opinion: the standing
+    # objection, argued on assignment. It is a position, not a belief, so it is
+    # never given a weight — a trust prior on an argument nobody holds would be
+    # read as a trust prior on the argument. The caller is told what it is; the
+    # members are told nothing, and answer it as they answer any other seat.
+    steelman: bool = False
 
     def __post_init__(self) -> None:
         self.label = self.label or self.id

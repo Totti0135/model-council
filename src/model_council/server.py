@@ -82,6 +82,37 @@ class Guest(BaseModel):
                                       "scale as the members' weights. Default 1.")
 
 
+class Steelman(BaseModel):
+    """A standing objection the server keeps alive across the rounds.
+
+    A council mostly agrees, and the agreement is the least informative thing it
+    produces: the strongest case against a plan is not volunteered by members
+    who think the plan is fine. This seats one — written each round by a member
+    you name, against whatever the table has converged on, and put back in front
+    of everyone as an ordinary anonymous answer.
+
+    Two things it is deliberately not. It is not a stance handed to the members
+    themselves: nobody at the table is told to argue a side it does not hold, so
+    what they say remains what they think. And it is not one broadside — it
+    answers again every round, because an objection that cannot reply to its
+    rebuttal is quoted rather than represented, and by the third round the table
+    is arguing with its own paraphrase of it.
+    """
+
+    model: str = Field(
+        default="",
+        description="The member that writes the objection. Defaults to the "
+                    "first member being asked. It also answers as itself, and "
+                    "is not told the two calls are related.")
+    tenure: int = Field(
+        default=0,
+        description="How many rounds the objection stays at the table, counting "
+                    "from round 2. Default 0 means every round after the first. "
+                    "When it ends before the discussion does, the transcript "
+                    "says the seat was retired by configuration — a silence "
+                    "left unexplained reads exactly like a position abandoned.")
+
+
 def _seat_guests(guests: list[Guest] | None) -> list[Answer]:
     """Turn caller-supplied answers into seats at the table.
 
@@ -164,11 +195,16 @@ def _route(m: Member) -> str:
 
 def _origin(m: Member) -> str:
     """What produced this answer, for its header."""
+    if m.steelman:
+        return f"argued on assignment, written by {m.model}"
     return "supplied by the caller" if m.guest else m.model
 
 
 def _labelled(a: Answer, weighted: bool) -> str:
-    tag = f" · weight {a.member.weight:g}" if weighted else ""
+    # The steelman is excluded from the weighting even when the rest of the
+    # table carries one: it argues an assigned side, so a number saying how far
+    # this council trusts it would be read as how far to trust the objection.
+    tag = f" · weight {a.member.weight:g}" if weighted and not a.member.steelman else ""
     return f"===== {a.member.label} ({_origin(a.member)}){tag} =====\n{a.text}"
 
 
@@ -278,15 +314,122 @@ def _revision_prompt(question: str, answers: list[Answer], me: Member, done: int
         origin = (f"ROUND-{done} ANSWER {seat}" if a.member.revises
                   else f"ANSWER {seat} (does not revise between rounds)")
         blocks.append(f"--- {origin} ---\n{a.text}")
-    blocks.append(
+    closing = [
         "Now give your final answer to the question above. Weigh the other answers on "
         "their merits: take what is right, correct anything you got wrong, and say "
         "plainly where you still disagree and why. Agreement is not the goal — do not "
         "abandon a position you believe is correct just because you are outnumbered, "
         "and do not manufacture disagreement either. Answer in full: your reply is read "
         "on its own, not as a diff against the previous round."
+    ]
+    # A seat that cannot speak again is the one a discussion drops by default:
+    # it will not restate its point, and nobody has to answer it to look as
+    # though they had. Requiring the answer costs one sentence, and the silence
+    # it prevents is indistinguishable in the transcript from a point refuted.
+    if any(a.ok and not a.member.revises and a.member.id != me.id for a in answers):
+        closing.append(
+            "One of the answers above is marked as not revising between rounds. Address "
+            "its strongest point explicitly — accept it, answer it, or say why it does "
+            "not bear on the question. It cannot restate itself, so passing over it is "
+            "not the same as having answered it."
+        )
+    blocks.append(" ".join(closing))
+    return "\n\n".join(blocks)
+
+
+def _steelman_prompt(question: str, answers: list[Answer], me: Member, done: int) -> str:
+    """What the standing objection is shown before it writes the next one.
+
+    Deliberately the same shape as `_revision_prompt`: the same question, the
+    same round of answers as bare letters, and its own last objection handed
+    back as its own. It is a seat in the discussion, not a critic outside it,
+    and it revises for the same reason the members do — an objection that only
+    ever restates itself is answered once and then ignored.
+
+    The assignment lives here and nowhere else. Nothing in what the members are
+    shown says this seat was told what to argue, because a member that knows an
+    argument was commissioned discounts the argument rather than answering it,
+    which is the one thing that would make the seat worthless.
+    """
+    mine = next((a for a in answers if a.member.id == me.id and a.ok), None)
+    blocks = [
+        f"Several AI models were asked the question below and have finished round "
+        f"{done}. Their answers are underneath, labelled by letter rather than by "
+        f"model. Your job is not to answer the question as they did. It is to put the "
+        f"strongest case against them on the table, so that whatever survives has been "
+        f"argued with.",
+        f"--- THE QUESTION ---\n{question}",
+    ]
+    if mine:
+        blocks.append(f"--- YOUR OWN ROUND-{done} OBJECTION ---\n{mine.text}\n\n"
+                      f"They have now replied to this. Carry forward what still stands, "
+                      f"drop what was actually answered, and say which of their replies "
+                      f"you accept.")
+    for i, a in enumerate(answers):
+        if not a.ok or a.member.id == me.id:
+            continue
+        blocks.append(f"--- ROUND-{done} ANSWER {_seat_letter(i)} ---\n{a.text}")
+    blocks.append(
+        "Now write the strongest case against where these answers are converging. Go "
+        "for the load-bearing claim, not the easy one: the assumption they share and "
+        "have not examined, the case their reasoning does not cover, the cost none of "
+        "them priced. If they disagree with each other, attack the strongest of them "
+        "rather than the gap between them. Be concrete and checkable — name the "
+        "condition under which they are wrong, so that they can answer you rather than "
+        "restate themselves. Do not manufacture an objection you cannot support: if "
+        "their position is sound on some point, say so plainly and spend the space on "
+        "the point where it is not. This is read as the best argument against them, "
+        "not as your own view, so it does not need to be balanced — but every part of "
+        "it has to be something you could defend if pressed."
     )
     return "\n\n".join(blocks)
+
+
+def _steelman_note(seat: Member, spoke: list[int], total: int) -> str:
+    """What the standing objection was — for the caller, who is the only one told.
+
+    The members answered it as they answer any other seat, which is what makes
+    their replies replies to the argument. The reader is the one who has to know
+    it was argued on assignment, for the same reason the reader and not the
+    table is given the weights.
+    """
+    when = (f"in round {spoke[0]}" if len(spoke) == 1
+            else f"once per round, in rounds {', '.join(str(n) for n in spoke)}")
+    lines = [
+        f"[STEELMAN — {seat.label} is not anyone's opinion. It was written by "
+        f"{seat.model} on assignment, {when}, against whatever the rest of the table "
+        f"had converged on, and put in front of the members as an ordinary anonymous "
+        f"answer: they were not told what it is, so what they wrote back is an answer "
+        f"to the argument and not to its provenance. Read it as the strongest objection "
+        f"this council could produce to order, never as evidence that anyone holds it. "
+        f"A point of its that survives being answered is worth something; the same "
+        f"point in the round it appeared is worth nothing yet.]",
+    ]
+    # A seat that stops speaking reads as a position abandoned unless the reason
+    # is stated — and the reason here is arithmetic, not concession. This is the
+    # whole difference between an adversary the server keeps alive and one the
+    # caller has to remember to re-run.
+    last = spoke[-1] if spoke else 0
+    if spoke and last < total:
+        lines.append(
+            f"[the objection was retired after round {last} because its tenure was set "
+            f"to {len(spoke)}, not because it was answered. It was still standing when "
+            f"it stopped, and nothing in round {last + 1} is its refutation.]")
+    # The mirror of the retirement note, and the more dangerous of the two. An
+    # objection nobody replied to reads as a point that survived; it is only a
+    # point that was never tested. It is always true of the last thing the seat
+    # says — and at two rounds it is true of everything it said, which is worth
+    # naming before the next call is priced rather than after it is read.
+    if spoke and last == total:
+        every = "" if len(spoke) > 1 else " — which here is all of it"
+        lines.append(
+            f"[nothing above answers the round-{last} objection{every}: it is the last "
+            f"thing said in this transcript, so no member has been asked to take it on. "
+            f"That is not a point that stood, it is a point that has not been examined. "
+            f"To have it answered, run the discussion one round past the seat: "
+            f"`rounds={min(last + 1, MAX_ROUNDS)}` with `tenure={len(spoke)}`, or carry "
+            f"the answers into `revise`, which has no ceiling.]")
+    return "\n\n".join(lines)
 
 
 # The one paragraph four tools need to say the same way. Written for the caller
@@ -374,7 +517,31 @@ it, the models never learn your subagent had an opinion. Pass the text verbatim,
 not a summary; a summary is not what you want critiqued.
 
 A guest speaks once and does not revise, so it appears in round 1 only. The
-transcript says so, and says it is not a retraction.
+transcript says so, and says it is not a retraction. From round 2 the members are
+told to answer its strongest point rather than pass over it: a seat that cannot
+restate itself is the one a discussion drops by default, and dropping it reads in
+the transcript exactly like answering it.
+
+`steelman` seats a standing objection. A council mostly agrees, and its agreement
+is the least informative thing it produces — the strongest case against a plan is
+not volunteered by members who think the plan is fine. Pass `{}` and one member
+writes that case each round, against whatever the table has converged on, and it
+goes back to everyone as an ordinary anonymous answer:
+
+    ask_all(prompt, rounds=3, steelman={})
+
+Note what is and is not assigned. No member is told to argue a side it does not
+hold, so what the members say is still what they think; the assignment lives in
+one extra call they are not told about, and they answer it as they answer any
+other seat. It speaks every round rather than once, because an objection that
+cannot reply to its own rebuttal is quoted rather than represented, and by the
+third round the table is arguing with its paraphrase of it. `tenure` buys fewer
+rounds than that, and when the seat is retired early the transcript says it was
+retired by configuration rather than answered — an unexplained silence reads as a
+position abandoned. You are told what the seat was and who wrote it; the members
+are not, because a model that knows an argument was commissioned discounts it
+instead of answering it. Read what it says as the strongest objection this
+council can produce to order, never as evidence that anyone holds it.
 
 Members may carry different weights — how much this council trusts each one. When
 they do, every answer is labeled with its weight and the transcript ends with the
@@ -386,7 +553,8 @@ about one document costs you the path once.""")
 async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ignore[valid-type]
                   system: str | None = None, rounds: int = 1,
                   guests: list[Guest] | None = None,
-                  materials: list[Material] | None = None) -> str:
+                  materials: list[Material] | None = None,
+                  steelman: Steelman | None = None) -> str:
     members, unknown = COUNCIL.resolve(models)
     seated = _seat_guests(guests)
     # Before anything is asked: a council given a question about a document it
@@ -416,6 +584,22 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
     weighted = len({m.weight for m in everyone}) > 1
 
     total = max(1, min(rounds, MAX_ROUNDS))
+    writer: Member | None = None
+    if steelman is not None:
+        if total < 2:
+            return ("[a steelman has nothing to argue against in a single round. It is "
+                    "written from what the table said last round, so it first speaks in "
+                    "round 2 — ask with rounds=2 or more, or drop it.]")
+        want = (steelman.model or "").strip()
+        writer = next((m for m in members if m.id == want), None) if want else members[0]
+        if writer is None:
+            asked = ", ".join(m.id for m in members)
+            return (f"[no member '{want}' is being asked, so it cannot write the "
+                    f"steelman. This call is asking: {asked}.]")
+        seat = Member(id=f"steelman:{writer.id}", label="Steelman", model=writer.model,
+                      guest=True, steelman=True)
+        # Every round after the first, unless the caller bought fewer.
+        tenure = total - 1 if steelman.tenure <= 0 else min(steelman.tenure, total - 1)
     answers = await asyncio.gather(*(ask_member(m, prompt, system, docs) for m in members))
 
     # `table` is what the next round is shown: this round's member answers plus
@@ -424,6 +608,8 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
     table = list(answers) + seated
     parts = [_round_block(1, total, "independent answers", table, weighted)]
     note = ""
+    steel: Answer | None = None      # its last objection, carried between rounds
+    spoke: list[int] = []            # the rounds it actually appeared in
 
     for done in range(1, total):
         answered = sum(a.ok for a in table)
@@ -432,16 +618,41 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
                     f"answers to put in front of each other, and this round produced "
                     f"{answered}.]")
             break
+        # The steelman writes for the coming round from the same table the
+        # members revise from, so it is a participant in that round and not a
+        # late arrival to the last one: it knows exactly what they knew.
+        #
         # The material goes again with every round: the members are stateless, so
         # "the document from last time" does not exist for them. It is the same
         # bytes in the same position each time, which is the arrangement an
         # endpoint that caches by prefix can actually reuse.
-        answers = await asyncio.gather(
-            *(ask_member(m, _revision_prompt(prompt, table, m, done), system, docs)
-              for m in members))
-        table = list(answers) + seated
+        speaking = writer is not None and done <= tenure
+        pending = [ask_member(m, _revision_prompt(prompt, table, m, done), system, docs)
+                   for m in members]
+        if speaking:
+            # `table` already carries its own last objection when it spoke, so it
+            # is handed that back as its own and revises rather than starting over.
+            pending.append(ask_member(writer, _steelman_prompt(prompt, table, seat, done),
+                                      system, docs))
+        done_calls = await asyncio.gather(*pending)
+
+        answers = list(done_calls[:len(members)])
+        if speaking:
+            # The objection is reseated under its own identity: the writer wrote
+            # it, but at the table it is a position, not that member's opinion.
+            steel = Answer(seat, done_calls[-1].text, ok=done_calls[-1].ok)
+            # Only a round it actually spoke in. A failed call is not a seat that
+            # said something, and the note below would otherwise account for a
+            # round the reader cannot find in the transcript.
+            if steel.ok:
+                spoke.append(done + 1)
+        # It sits at the end of the table, so retiring it shifts nobody's letter
+        # and `B` is still `B` in the round after it stops.
+        holds = [steel] if speaking and steel and steel.ok else []
+        shown = answers + holds
+        table = answers + seated + holds
         parts.append(_round_block(done + 1, total,
-                                  "revised after reading the other answers", answers,
+                                  "revised after reading the other answers", shown,
                                   weighted))
 
     out = "\n\n".join(parts) + note
@@ -460,9 +671,17 @@ async def ask_all(prompt: str, models: list[ModelId] | None = None,  # type: ign
     if len(parts) > 1:
         # Only after a revision round: round 1 is answered blind, so no member
         # has seen another's letter yet and there is no key to explain.
-        out += f"\n\n{_seat_key(table)}"
+        #
+        # A steelman that has been retired is off the table but not out of the
+        # transcript, and the reader still has to be able to tell whose letter
+        # `F` was three rounds ago. Its seat was last, so naming it here restores
+        # the key without moving anyone else's letter.
+        retired = bool(spoke) and steel is not None and not any(a is steel for a in table)
+        out += f"\n\n{_seat_key((table + [steel]) if retired else table)}"
     if seated and total > 1:
         out += f"\n\n{_guest_note(seated)}"
+    if spoke:
+        out += f"\n\n{_steelman_note(seat, spoke, len(parts))}"
     if weighted:
         out += f"\n\n{_weight_note(everyone)}"
     return out + (f"\n\n{_unknown(unknown)}" if unknown else "")

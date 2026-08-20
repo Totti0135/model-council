@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.12.0
+
+**The council can be given a standing objection.** Everything this server did
+against convergence was defensive — the members are anonymous to each other,
+they are never told the weights, and the closing instruction tells them not to
+cave because they are outnumbered — and none of it created any pressure to
+diverge. A council mostly agrees, its agreement is the least informative thing it
+produces, and the strongest case against a plan is not volunteered by members who
+think the plan is fine.
+
+```
+ask_all(prompt, rounds=3, steelman={})
+```
+
+One member writes that case each round, against whatever the table has converged
+on, and it goes back to everyone as an ordinary anonymous answer for the next
+round to deal with.
+
+**No member is told to argue a side it does not hold**, which is the line between
+this and a debate mode. What the members say is still what they think; the
+assignment lives in one extra call they are never told about. A seat labelled as
+arguing on assignment gets discounted rather than answered — so the provenance
+goes to the caller, in a note beside the weights note, and the argument goes to
+the members.
+
+**It answers again every round.** An objection that cannot reply to its own
+rebuttal is quoted rather than represented: it cannot correct a misreading of
+itself, so by the third round the table is arguing with its paraphrase and
+counting that as an answer. `tenure` buys fewer rounds, and a seat retired early
+says it was retired by configuration — an unexplained silence reads exactly like
+a position abandoned. The mirror of that is stated too: the objection's last word
+is the transcript's last word, so nobody was asked to take it on, and a point
+nobody answered is not a point that stood but one never examined. At `rounds=2`
+that covers everything it said, and the note names the setting that fixes it
+rather than leaving it to be discovered after the call is paid for.
+
+It is never given a weight, even when the rest of the table carries one: a trust
+prior on an argument nobody holds would be read as a trust prior on the argument.
+
+**A seat that does not revise must now be answered, not passed over.** A guest
+speaks once and will not restate itself, so a discussion drops it by default —
+and a transcript in which nobody engaged it is indistinguishable from one in
+which it was answered. From round 2 the members are told to take its strongest
+point explicitly: accept it, answer it, or say why it does not bear on the
+question. The instruction appears only when such a seat is actually at the table.
+
 ## 0.11.0
 
 **The route out is chosen per seat, and the council can have a default.** A
